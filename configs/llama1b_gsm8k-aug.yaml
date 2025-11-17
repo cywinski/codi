@@ -5,6 +5,8 @@ model_args:
   lora_alpha: 32
   lora_init: true
   token: null
+  full_precision: true
+  # attn_implementation: "flash_attention_2"
 
 # Data Arguments
 data_args:
@@ -23,14 +25,14 @@ hub:
 
 # Training Arguments
 training_args:
-  output_dir: "codi_llama1b_full"
+  output_dir: "./codi_llama1b_full"
   expt_name: "gsm8k_llama1b_latent_baseline"
-  logging_dir: "codi_llama1b_full/logs"
-  logging_steps: 1
+  logging_dir: "./codi_llama1b_full/logs"
+  logging_steps: 10
   seed: 11
   model_max_length: 512
   per_device_train_batch_size: 32
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 1
   bf16: true
   num_train_epochs: 10
   learning_rate: 8e-4

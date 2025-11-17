@@ -8,8 +8,6 @@ from peft import get_peft_model
 from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
 @dataclass
 class ModelArguments:
@@ -20,6 +18,10 @@ class ModelArguments:
     full_precision: bool = field(
         default=True, metadata={"help": "whether use int4 for the base model"}
     )
+    # attn_implementation: str = field(
+    #     default="flash_attention_2",
+    #     metadata={"help": "attention implementation"},
+    # )
     train: bool = field(
         default=True,
         metadata={
@@ -193,6 +195,7 @@ class CODI(torch.nn.Module):
                 torch_dtype=(
                     torch.float16 if training_args.bf16 is False else torch.bfloat16
                 ),
+                # attn_implementation=model_args.attn_implementation,
             )
         else:
             self.codi = model_wrapper_class.from_pretrained(
@@ -200,6 +203,7 @@ class CODI(torch.nn.Module):
                 torch_dtype=(
                     torch.float16 if training_args.bf16 is False else torch.bfloat16
                 ),
+                # attn_implementation=model_args.attn_implementation,
                 quantization_config=transformers.BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_compute_dtype=torch.bfloat16,

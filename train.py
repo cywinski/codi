@@ -4,7 +4,6 @@ import os
 from math import ceil
 from pathlib import Path
 
-import torch
 import torch.distributed as dist
 import transformers
 import yaml
@@ -24,14 +23,21 @@ else:
     # Also try loading from current directory
     load_dotenv()
 
-# Initialize distributed training if running with torchrun
-if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
-    if torch.cuda.is_available() and "LOCAL_RANK" in os.environ:
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def is_main_process():
+    """Check if this is the main process (rank 0)"""
+    # Check if we're in distributed mode
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank() == 0
+
+    # Check environment variables set by torchrun
+    if "RANK" in os.environ:
+        return int(os.environ["RANK"]) == 0
+    if "LOCAL_RANK" in os.environ:
+        return int(os.environ["LOCAL_RANK"]) == 0
+
+    # Single process mode
+    return True
 
 
 class CustomTrainer(Trainer):
@@ -185,18 +191,19 @@ def train():
     # Initialize wandb if configured
     wandb_config = config.get("wandb", {})
     if wandb_config and training_args.report_to and "wandb" in training_args.report_to:
-        wandb.init(
-            project=wandb_config.get("project", "codi"),
-            name=wandb_config.get("run_name", training_args.expt_name),
-            config={
-                "model_args": model_config,
-                "data_args": config.get("data_args", {}),
-                "training_args": training_config,
-            },
-            settings=wandb.Settings(
-                start_method="thread"
-            ),  # Use thread-based initialization
-        )
+        if is_main_process():
+            wandb.init(
+                project=wandb_config.get("project", "codi"),
+                name=wandb_config.get("run_name", training_args.expt_name),
+                config={
+                    "model_args": model_config,
+                    "data_args": config.get("data_args", {}),
+                    "training_args": training_config,
+                },
+                settings=wandb.Settings(
+                    start_method="thread"
+                ),  # Use thread-based initialization
+            )
 
     data_module = make_supervised_data_module(
         tokenizer=tokenizer,

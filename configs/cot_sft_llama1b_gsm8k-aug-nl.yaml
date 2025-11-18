@@ -5,7 +5,7 @@ model_args:
   lora_alpha: 32
   lora_init: true
   token: null
-  full_precision: true
+  full_precision: false
   attn_implementation: "flash_attention_2"
 
 # Data Arguments
@@ -19,7 +19,7 @@ data_args:
 # Wandb Arguments
 wandb:
   project: "codi"
-  run_name: "sft_baseline_llama1b_gsm8k-strategyqa-commonsense"
+  run_name: "cot_sft_llama1b_gsm8k-strategyqa-commonsense"
 
 # Hub Arguments
 hub:
@@ -29,9 +29,9 @@ hub:
 
 # Training Arguments
 training_args:
-  output_dir: "./models/sft_baseline_llama1b_gsm8k-strategyqa-commonsense"
-  expt_name: "sft_baseline_llama1b_gsm8k-strategyqa-commonsense"
-  logging_dir: "./models/sft_baseline_llama1b_gsm8k-strategyqa-commonsense/logs"
+  output_dir: "./models/cot_sft_llama1b_gsm8k-strategyqa-commonsense"
+  expt_name: "cot_sft_llama1b_gsm8k-strategyqa-commonsense"
+  logging_dir: "./models/cot_sft_llama1b_gsm8k-strategyqa-commonsense/logs"
   logging_steps: 10
   seed: 11
   model_max_length: 512
@@ -42,17 +42,11 @@ training_args:
   num_train_epochs: 3
   learning_rate: 8e-4
   max_grad_norm: 2.0
-  save_strategy: "no"
-  save_total_limit: 1
-  save_safetensors: false
+  save_strategy: "epoch"
   weight_decay: 0.1
   warmup_ratio: 0.03
   lr_scheduler_type: "cosine"
-  do_train: true
   report_to: "wandb"
   logging_strategy: "steps"
-  exp_data_num: 200
-  remove_eos: true
-  max_token_num: 256
   dataloader_num_workers: 4
   ddp_find_unused_parameters: false

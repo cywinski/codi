@@ -8,13 +8,13 @@ import torch.distributed as dist
 import transformers
 import yaml
 from dotenv import load_dotenv
-from peft import LoraConfig, TaskType, get_peft_model
-from transformers import AutoModelForCausalLM
+from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 from trl import SFTConfig, SFTTrainer
 
 import wandb
 from datasets import Dataset
-from src.datasets import make_supervised_data_module
+from src.datasets import IGNORE_INDEX, make_supervised_data_module
 from src.model import DataArguments, ModelArguments, TrainingArguments
 
 # Load environment variables from .env file if it exists
@@ -56,10 +56,11 @@ def create_sft_dataset(train_dataset, model):
             + decoder_input_ids.tolist()
         )
         assistant_masks = [0] * encoder_len + [1] * (len(input_ids) - encoder_len)
-        assert len(assistant_masks) == len(input_ids)
+        labels = input_ids.copy()
+        labels[assistant_masks == 0] = IGNORE_INDEX
         return {
             "input_ids": input_ids,
-            "completion_mask": assistant_masks,
+            "labels": labels,
         }
 
     # Transform all items
@@ -67,6 +68,42 @@ def create_sft_dataset(train_dataset, model):
 
     # Create HuggingFace Dataset from list of dictionaries
     return Dataset.from_list(transformed_data)
+
+
+def create_quantization_config(model_args):
+    """Create BitsAndBytesConfig based on model arguments."""
+    if not hasattr(model_args, "load_in_4bit") and not hasattr(
+        model_args, "load_in_8bit"
+    ):
+        return None
+
+    load_in_4bit = getattr(model_args, "load_in_4bit", False)
+    load_in_8bit = getattr(model_args, "load_in_8bit", False)
+
+    if not load_in_4bit and not load_in_8bit:
+        return None
+
+    if load_in_4bit and load_in_8bit:
+        raise ValueError("Cannot use both 4-bit and 8-bit quantization simultaneously")
+
+    if load_in_4bit:
+        # 4-bit quantization config
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=getattr(
+                model_args, "bnb_4bit_use_double_quant", True
+            ),
+            bnb_4bit_quant_type=getattr(model_args, "bnb_4bit_quant_type", "nf4"),
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+    else:
+        # 8-bit quantization config
+        bnb_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_threshold=getattr(model_args, "llm_int8_threshold", 6.0),
+        )
+
+    return bnb_config
 
 
 def train():
@@ -117,6 +154,40 @@ def train():
     training_args = TrainingArguments(**training_config)
 
     ##########################
+    #   Quantization Config  #
+    ##########################
+    # Check for quantization settings in model_args
+    use_quantization = getattr(model_args, "load_in_4bit", False) or getattr(
+        model_args, "load_in_8bit", False
+    )
+
+    # Create quantization config if needed
+    quantization_config = None
+    if use_quantization:
+        if getattr(model_args, "load_in_4bit", False):
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=getattr(
+                    model_args, "bnb_4bit_use_double_quant", True
+                ),
+                bnb_4bit_quant_type=getattr(model_args, "bnb_4bit_quant_type", "nf4"),
+                bnb_4bit_compute_dtype=torch.bfloat16
+                if training_args.bf16
+                else torch.float16,
+            )
+        elif getattr(model_args, "load_in_8bit", False):
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_threshold=getattr(model_args, "llm_int8_threshold", 6.0),
+            )
+
+        if is_main_process():
+            quant_type = (
+                "4-bit" if getattr(model_args, "load_in_4bit", False) else "8-bit"
+            )
+            print(f"Loading model with {quant_type} quantization using bitsandbytes")
+
+    ##########################
     #       Peft Model       #
     ##########################
     lora_config = None
@@ -154,10 +225,17 @@ def train():
             init_lora_weights=True,
         )
 
+    ##########################
+    #      Load Model        #
+    ##########################
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
+        quantization_config=quantization_config,
         dtype=torch.float16 if training_args.bf16 is False else torch.bfloat16,
         attn_implementation=model_args.attn_implementation,
+        device_map="auto"
+        if use_quantization
+        else None,  # Required for quantized models
     )
     ori_vocab_size = model.config.vocab_size
 
@@ -166,19 +244,32 @@ def train():
     model.bot_id = ori_vocab_size + 1
     model.eot_id = ori_vocab_size + 2
 
-    # Resize embeddings (only for full precision models, quantized models are already on device)
-    if model_args.full_precision:
-        model.resize_token_embeddings(
-            ori_vocab_size + 3, mean_resizing=False
-        )  # dummy values for mem tokens
+    # Resize embeddings
+    if use_quantization:
+        # For quantized models, they're already on device
+        model.resize_token_embeddings(ori_vocab_size + 3, mean_resizing=False)
+        # Prepare model for k-bit training
+        model = prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=getattr(
+                training_args, "gradient_checkpointing", False
+            ),
+        )
+    elif model_args.full_precision:
+        # Full precision model
+        model.resize_token_embeddings(ori_vocab_size + 3, mean_resizing=False)
         # Move to GPU after resizing embeddings
         if torch.cuda.is_available():
             model = model.to("cuda")
     else:
-        # For quantized models, resize is handled differently
+        # Other quantization methods (not bitsandbytes)
         model.resize_token_embeddings(ori_vocab_size + 3, mean_resizing=False)
 
-    model = get_peft_model(model, lora_config)
+    # Apply LoRA
+    if lora_config:
+        model = get_peft_model(model, lora_config)
+        if is_main_process():
+            model.print_trainable_parameters()
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
@@ -215,6 +306,14 @@ def train():
                     "model_args": model_config,
                     "data_args": config.get("data_args", {}),
                     "training_args": training_config,
+                    "quantization": {
+                        "enabled": use_quantization,
+                        "type": "4-bit"
+                        if getattr(model_args, "load_in_4bit", False)
+                        else "8-bit"
+                        if getattr(model_args, "load_in_8bit", False)
+                        else None,
+                    },
                 },
                 settings=wandb.Settings(
                     start_method="thread"
@@ -228,6 +327,7 @@ def train():
         training_args=training_args,
     )
     train_dataset = data_module["train_dataset"]
+
     sft_train_dataset = create_sft_dataset(train_dataset, model)
     sft_config = SFTConfig(
         output_dir=training_args.output_dir,
@@ -255,7 +355,6 @@ def train():
         hub_token=env_vars["hf_token"],
         hub_private_repo=hub_config.get("private_repo", False),
         run_name=wandb_config.get("run_name", training_args.expt_name),
-        completion_only_loss=True,
         packing=False,
     )
     trainer = SFTTrainer(

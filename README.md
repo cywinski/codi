@@ -6,17 +6,11 @@ This is the official implementation of the paper: [CODI: Compressing Chain-of-Th
 
 ## Setup
 
-**Clone the Repository**:
-```
-git clone git@github.com:zhenyi4/CODI.git
-cd CODI
-```
-
 **Environment Setup**:
 ```
-conda create --name codi python=3.12
-conda activate codi
-pip install -r requirements.txt
+uv venv
+uv pip install -r requirements.txt
+uv pip install flash-attn --no-build-isolation
 ```
 
 ## Running the Results
@@ -24,12 +18,12 @@ pip install -r requirements.txt
 Pretrained model weights are available at https://huggingface.co/zen-E, including:
 * zen-E/CODI-gpt2
 * zen-E/CODI-llama3.2-1b-Instruct
- 
+
 To evaluate accuracy on GSM8K, run:
 ```
 bash script/test_gpt2.sh # or script/test_llama1b.sh
 ```
-You can change the data_name argument to "svamp", "gsm-hard", or "multi-arith" to evaluate on out-of-distribution (OOD) mathematical benchmarks. 
+You can change the data_name argument to "svamp", "gsm-hard", or "multi-arith" to evaluate on out-of-distribution (OOD) mathematical benchmarks.
 
 ## Interpret Latent Thoughts (for Section 5 in the Paper)
 
@@ -85,7 +79,7 @@ You can change the testing script's data_name to "commonsense" for evaluation.
 If you use this code base in your research, please cite our paper with the following BibTex entry:
 ```bibtex
 @article{shen2025codi,
-      title={CODI: Compressing Chain-of-Thought into Continuous Space via Self-Distillation}, 
+      title={CODI: Compressing Chain-of-Thought into Continuous Space via Self-Distillation},
       author={Zhenyi Shen and Hanqi Yan and Linhai Zhang and Zhanghao Hu and Yali Du and Yulan He},
       year={2025},
       journal={arXiv preprint arxiv:2502.21074},

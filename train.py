@@ -84,7 +84,9 @@ def train():
     parser = argparse.ArgumentParser(description="Train CODI model")
     parser.add_argument("config", type=str, help="Path to YAML config file")
     args = parser.parse_args()
-
+    os.environ["TOKENIZERS_PARALLELISM"] = (
+        "false"  # Disable tokenizers parallelism warning
+    )
     # Load YAML config
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
@@ -224,7 +226,7 @@ def train():
     # if "qwen" in model_args.model_name_or_path.lower():
     #    trainer.model.codi.base_model.model.model.embed_tokens.weight = torch.nn.Parameter(model.codi.base_model.model.lm_head.weight.clone())
 
-    trainer.save_state()
+    # trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
 
 

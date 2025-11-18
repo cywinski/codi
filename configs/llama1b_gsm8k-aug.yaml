@@ -36,7 +36,7 @@ training_args:
   gradient_accumulation_steps: 1
   bf16: true
   max_steps: -1
-  num_train_epochs: 10
+  num_train_epochs: 3
   learning_rate: 8e-4
   max_grad_norm: 2.0
   save_strategy: "no"
@@ -57,5 +57,8 @@ training_args:
   exp_data_num: 200
   remove_eos: true
   distill_loss_factor: 20
-  print_ref_model_stats: true
-  max_token_num: 200
+  print_ref_model_stats: false
+  print_loss: false
+  max_token_num: 256
+  dataloader_num_workers: 4
+  ddp_find_unused_parameters: false

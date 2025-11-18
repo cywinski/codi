@@ -66,7 +66,7 @@ class CustomTrainer(Trainer):
         if step % self.args.logging_steps == 0:
             self.log(
                 {
-                    "loss": loss,
+                    "loss": loss.item(),
                     "ce_loss": outputs["ce_loss"],
                     "distill_loss": outputs["distill_loss"],
                     "ref_ce_loss": outputs["ref_ce_loss"],

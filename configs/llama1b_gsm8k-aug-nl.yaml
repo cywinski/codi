@@ -14,7 +14,7 @@ data_args:
     - "icot_full"
     - "strategy"
     - "commonsense"
-  max_samples: 100
+  max_samples: null
 
 # Wandb Arguments
 wandb:

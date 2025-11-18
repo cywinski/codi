@@ -6,8 +6,9 @@ from typing import Dict, Sequence
 
 import torch
 import transformers
-from datasets import load_dataset
 from torch.utils.data import Dataset
+
+from datasets import load_dataset
 
 IGNORE_INDEX = -100
 
@@ -109,9 +110,7 @@ def preprocess(
             for x in cot_id
         ]
     answers_id = [
-        torch.tensor(
-            x.numpy().tolist() + [tokenizer.eos_token_id], dtype=torch.long
-        )
+        torch.tensor(x.numpy().tolist() + [tokenizer.eos_token_id], dtype=torch.long)
         for x in answers_id
     ]
 
@@ -182,7 +181,9 @@ def preprocess(
 
 class SupervisedDataset(Dataset):
     QUESTION_PROMPT = "\nAnswer the above question. First think step by step and then answer the final number.\n"
-    QUESTION_DA_PROMPT = "\nAnswer the above question. Answer the final number directly in one number.\n"
+    QUESTION_DA_PROMPT = (
+        "\nAnswer the above question. Answer the final number directly in one number.\n"
+    )
 
     def __init__(
         self,
@@ -240,6 +241,7 @@ class SupervisedDataset(Dataset):
                     cot = ""
                 cots.append(cot)
                 answers.append(answer)
+                token_nums.append(token_num)
             elif "icot" in self.data_name:  # icot (GSM8k-Aug)
                 # avoid OOM: remove very long data
                 token_num = len(
@@ -269,40 +271,40 @@ class SupervisedDataset(Dataset):
                 questions.append(question)
                 cots.append(" ".join(cot))
                 answers.append(answer)
+                token_nums.append(token_num)
             elif "commonsense" in self.data_name or "strategy" in self.data_name:
                 question = example["question"].strip() + "\n"
                 cot = example["cot"].strip() + "\n"
                 answer = f"The answer is: {str(example['answer']).strip()}"
 
                 # avoid OOM: remove very long data
-                token_num = len(
-                    tokenizer.encode(question + " " + cot + " " + answer)
-                )
+                token_num = len(tokenizer.encode(question + " " + cot + " " + answer))
                 if token_num > training_args.max_token_num:
                     continue
                 questions.append(question)
                 cots.append(cot)
                 answers.append(answer)
+                token_nums.append(token_num)
             elif "prontoqa" in data_args.data_name:
                 question = example["question"].strip() + "\n"
                 cot = "\n".join(example["steps"][:-1]) + "\n"
                 answer = f"The answer is: {str(example['answer']).strip()}"
 
                 # avoid OOM: remove very long data
-                token_num = len(
-                    tokenizer.encode(question + " " + cot + " " + answer)
-                )
+                token_num = len(tokenizer.encode(question + " " + cot + " " + answer))
                 if token_num > training_args.max_token_num:
                     continue
                 questions.append(question)
                 cots.append(cot)
                 answers.append(answer)
+                token_nums.append(token_num)
             else:
                 raise NotImplementedError
         if training_args.exp_mode:
             questions = questions[: training_args.exp_data_num]
             cots = cots[: training_args.exp_data_num]
             answers = answers[: training_args.exp_data_num]
+            token_nums = token_nums[: training_args.exp_data_num]
 
         print(f"{len(cots)} data in total...")
         logging.warning("Tokenizing inputs... This may take some time...")
@@ -311,6 +313,10 @@ class SupervisedDataset(Dataset):
             questions, cots, answers, tokenizer, bot, eot, training_args.remove_eos
         )
         self.keys = list(self.data_dict.keys())
+
+        # Print total number of training tokens
+        total_tokens = sum(token_nums)
+        print(f"Total number of training tokens: {total_tokens:,}")
 
     def __len__(self):
         return len(self.data_dict["encoder_input_ids"])
@@ -379,13 +385,9 @@ class DataCollatorForSupervisedDataset(object):
             decoder_input_ids=decoder_input_ids,
             ref_input_ids=ref_input_ids,
             labels=labels,
-            encoder_attention_mask=encoder_input_ids.ne(
-                self.tokenizer.pad_token_id
-            ),
+            encoder_attention_mask=encoder_input_ids.ne(self.tokenizer.pad_token_id),
             ref_answer_position=torch.tensor(ref_answer_position, dtype=torch.long),
-            model_answer_position=torch.tensor(
-                model_answer_position, dtype=torch.long
-            ),
+            model_answer_position=torch.tensor(model_answer_position, dtype=torch.long),
             ref_attention_mask=ref_input_ids.ne(self.tokenizer.pad_token_id),
             ref_labels=ref_labels,
         )
@@ -467,6 +469,4 @@ def make_supervised_data_module(tokenizer, data_args, model, training_args) -> D
             data_collator=data_collator,
         )
     else:
-        raise NotImplementedError(
-            f"Dataset {data_args.data_name} is not supported."
-        )
+        raise NotImplementedError(f"Dataset {data_args.data_name} is not supported.")

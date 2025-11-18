@@ -6,11 +6,12 @@ model_args:
   lora_init: true
   token: null
   full_precision: true
-  # attn_implementation: "flash_attention_2"
+  attn_implementation: "flash_attention_2"
 
 # Data Arguments
 data_args:
   data_name: "icot"
+  max_samples: null
 
 # Wandb Arguments
 wandb:
@@ -25,15 +26,16 @@ hub:
 
 # Training Arguments
 training_args:
-  output_dir: "./codi_llama1b_full"
-  expt_name: "gsm8k_llama1b_latent_baseline"
-  logging_dir: "./codi_llama1b_full/logs"
+  output_dir: "./models/test"
+  expt_name: "llama1b_gsm8k-aug"
+  logging_dir: "./models/llama1b_gsm8k-aug/logs"
   logging_steps: 10
   seed: 11
   model_max_length: 512
   per_device_train_batch_size: 32
   gradient_accumulation_steps: 1
   bf16: true
+  max_steps: -1
   num_train_epochs: 10
   learning_rate: 8e-4
   max_grad_norm: 2.0

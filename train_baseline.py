@@ -59,7 +59,7 @@ def create_sft_dataset(train_dataset, model):
         assert len(assistant_masks) == len(input_ids)
         return {
             "input_ids": input_ids,
-            "assistant_masks": assistant_masks,
+            "completion_mask": assistant_masks,
         }
 
     # Transform all items
@@ -157,6 +157,7 @@ def train():
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         dtype=torch.float16 if training_args.bf16 is False else torch.bfloat16,
+        attn_implementation=model_args.attn_implementation,
     )
     ori_vocab_size = model.config.vocab_size
 

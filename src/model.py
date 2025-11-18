@@ -195,21 +195,20 @@ class CODI(torch.nn.Module):
         self.training_args = training_args
         self.model_name = model_args.model_name_or_path
         model_wrapper_class = AutoModelForCausalLM
+
+        # Store the dtype for later use
+        self.dtype = torch.float16 if training_args.bf16 is False else torch.bfloat16
+
         if model_args.full_precision:
             self.codi = model_wrapper_class.from_pretrained(
                 self.model_name,
-                torch_dtype=(
-                    torch.float16 if training_args.bf16 is False else torch.bfloat16
-                ),
+                torch_dtype=self.dtype,
                 attn_implementation=model_args.attn_implementation,
-                device_map="auto",
             )
         else:
             self.codi = model_wrapper_class.from_pretrained(
                 self.model_name,
-                torch_dtype=(
-                    torch.float16 if training_args.bf16 is False else torch.bfloat16
-                ),
+                torch_dtype=self.dtype,
                 attn_implementation=model_args.attn_implementation,
                 device_map="auto",
                 quantization_config=transformers.BitsAndBytesConfig(
@@ -223,23 +222,24 @@ class CODI(torch.nn.Module):
         ori_vocab_size = self.codi.config.vocab_size
         self.training = self.model_args.train
 
-        # Store the dtype for later use
-        self.dtype = torch.float16 if training_args.bf16 is False else torch.bfloat16
-
         # special tokens to enclose the latent embeddings
         self.pad_token_id = ori_vocab_size
         self.bot_id = ori_vocab_size + 1
         self.eot_id = ori_vocab_size + 2
 
-        self.codi.resize_token_embeddings(
-            ori_vocab_size + 3, mean_resizing=False
-        )  # dummy values for mem tokens
-
-        # Ensure embeddings are in the correct dtype after resizing
-        if hasattr(self.codi, 'get_input_embeddings'):
-            self.codi.get_input_embeddings().to(self.dtype)
-        elif hasattr(self.codi, 'model') and hasattr(self.codi.model, 'embed_tokens'):
-            self.codi.model.embed_tokens.to(self.dtype)
+        # Resize embeddings (only for full precision models, quantized models are already on device)
+        if model_args.full_precision:
+            self.codi.resize_token_embeddings(
+                ori_vocab_size + 3, mean_resizing=False
+            )  # dummy values for mem tokens
+            # Move to GPU after resizing embeddings
+            if torch.cuda.is_available():
+                self.codi = self.codi.to('cuda')
+        else:
+            # For quantized models, resize is handled differently
+            self.codi.resize_token_embeddings(
+                ori_vocab_size + 3, mean_resizing=False
+            )
 
         self.dim = self.codi.config.hidden_size
         self.num_latent = training_args.num_latent
@@ -261,8 +261,10 @@ class CODI(torch.nn.Module):
             )
             if not self.prj_no_ln:
                 self.prj.add_module("ln", nn.LayerNorm(self.dim))
-            # Cast projection layer to the correct dtype
-            self.prj.to(self.dtype)
+            # Cast projection layer to the correct dtype and device
+            self.prj = self.prj.to(dtype=self.dtype)
+            if torch.cuda.is_available() and model_args.full_precision:
+                self.prj = self.prj.to('cuda')
 
         # Losses
         self.print_loss = training_args.print_loss

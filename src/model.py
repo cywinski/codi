@@ -232,7 +232,7 @@ class CODI(torch.nn.Module):
         self.eot_id = ori_vocab_size + 2
 
         self.codi.resize_token_embeddings(
-            ori_vocab_size + 3
+            ori_vocab_size + 3, mean_resizing=False
         )  # dummy values for mem tokens
 
         # Ensure embeddings are in the correct dtype after resizing

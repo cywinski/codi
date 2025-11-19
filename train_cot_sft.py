@@ -53,11 +53,15 @@ def create_sft_dataset(train_dataset, model):
         input_ids = (
             encoder_input_ids.tolist()
             + item["ref_input_ids"][encoder_len - 1 : -decoder_len + 1].tolist()
-            + decoder_input_ids.tolist()
+            + [model.eot_id]
+            + decoder_input_ids[2:].tolist()
         )
         assistant_masks = [0] * encoder_len + [1] * (len(input_ids) - encoder_len)
         labels = input_ids.copy()
-        labels[assistant_masks == 0] = IGNORE_INDEX
+        labels = [
+            IGNORE_INDEX if mask == 0 else token
+            for token, mask in zip(labels, assistant_masks)
+        ]
         return {
             "input_ids": input_ids,
             "labels": labels,
@@ -238,6 +242,9 @@ def train():
         tokenizer.pad_token_id = model.pad_token_id
         if tokenizer.pad_token_id is None:  # error handling
             tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("[PAD]")
+    tokenizer.add_special_tokens({"additional_special_tokens": ["<|bot|>", "<|eot|>"]})
+    tokenizer.bot_id = tokenizer.convert_tokens_to_ids("<|bot|>")
+    tokenizer.eot_id = tokenizer.convert_tokens_to_ids("<|eot|>")
 
     training_args.output_dir = os.path.join(
         training_args.output_dir,

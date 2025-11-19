@@ -6,7 +6,7 @@ model_args:
   lora_init: true
   token: null
   full_precision: true
-  attn_implementation: "flash_attention_2"
+  attn_implementation: "eager"
 
 # Data Arguments
 data_args:
@@ -35,11 +35,11 @@ training_args:
   logging_steps: 10
   seed: 11
   model_max_length: 512
-  per_device_train_batch_size: 16
-  gradient_accumulation_steps: 2
+  per_device_train_batch_size: 32
+  gradient_accumulation_steps: 1
   bf16: true
   max_steps: -1
-  num_train_epochs: 3
+  num_train_epochs: 5
   learning_rate: 8e-4
   max_grad_norm: 2.0
   save_strategy: "epoch"

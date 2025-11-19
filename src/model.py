@@ -396,7 +396,7 @@ class CODI(torch.nn.Module):
                     torch.float16 if training_args.bf16 is False else torch.bfloat16
                 ),
                 resume_download=True,
-                attn_implementation=model_args.attn_implementation,
+                # attn_implementation=model_args.attn_implementation,
             )
         else:
             self.codi = model_wrapper_class.from_pretrained(
@@ -411,7 +411,7 @@ class CODI(torch.nn.Module):
                     bnb_4bit_use_double_quant=False,
                     bnb_4bit_quant_type="nf4",
                 ),
-                attn_implementation=model_args.attn_implementation,
+                # attn_implementation=model_args.attn_implementation,
             )
 
         ori_vocab_size = self.codi.config.vocab_size

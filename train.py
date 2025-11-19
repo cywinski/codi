@@ -4,11 +4,14 @@ import os
 from math import ceil
 from pathlib import Path
 
+import torch
 import torch.distributed as dist
 import transformers
 import yaml
 from dotenv import load_dotenv
+from huggingface_hub import hf_hub_download
 from peft import LoraConfig, TaskType
+from safetensors.torch import load_file
 from transformers import Trainer
 
 import wandb
@@ -166,6 +169,57 @@ def train():
         )
 
     model = CODI(model_args, training_args, lora_config)
+
+    # Load model weights from HuggingFace checkpoint if specified
+    if hub_config and hub_config.get("resume_from_checkpoint"):
+        checkpoint_id = hub_config.get("resume_from_checkpoint")
+        if is_main_process():
+            print(f"Loading model weights from HuggingFace checkpoint: {checkpoint_id}")
+
+        hf_token = (
+            os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN") or model_args.token
+        )
+
+        # Try to load safetensors first, then fall back to pytorch_model.bin
+        try:
+            checkpoint_path = hf_hub_download(
+                repo_id=checkpoint_id,
+                filename="model.safetensors",
+                token=hf_token,
+            )
+            state_dict = load_file(checkpoint_path)
+        except Exception:
+            try:
+                checkpoint_path = hf_hub_download(
+                    repo_id=checkpoint_id,
+                    filename="pytorch_model.bin",
+                    token=hf_token,
+                )
+                state_dict = torch.load(checkpoint_path, map_location="cpu")
+            except Exception as e:
+                if is_main_process():
+                    print(
+                        f"Warning: Could not load checkpoint from {checkpoint_id}: {e}"
+                    )
+                    print("Continuing with default initialization...")
+                state_dict = None
+
+        if state_dict is not None:
+            # Load state dict with strict=False to handle any key mismatches
+            missing_keys, unexpected_keys = model.load_state_dict(
+                state_dict, strict=False
+            )
+            if is_main_process():
+                if missing_keys:
+                    print(
+                        f"Missing keys when loading checkpoint: {len(missing_keys)} keys"
+                    )
+                if unexpected_keys:
+                    print(
+                        f"Unexpected keys when loading checkpoint: {len(unexpected_keys)} keys"
+                    )
+                print(f"Successfully loaded weights from {checkpoint_id}")
+
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         token=model_args.token,

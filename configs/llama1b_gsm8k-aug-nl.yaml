@@ -26,6 +26,7 @@ hub:
   push_to_hub: true
   account: "bcywinski"
   private_repo: false
+  resume_from_checkpoint: "bcywinski/codi_llama1b_gsm8k-strategyqa-commonsense"  # HuggingFace checkpoint ID to resume training from (e.g., "username/model-name")
 
 # Training Arguments
 training_args:

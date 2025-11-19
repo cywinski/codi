@@ -1,10 +1,12 @@
 from dataclasses import dataclass, field
 from typing import Optional
+import os
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import transformers
-from peft import get_peft_model
+from peft import get_peft_model, LoraConfig, TaskType
 from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -190,6 +192,197 @@ def freeze_model(model):
 
 
 class CODI(torch.nn.Module):
+    @classmethod
+    def from_pretrained(
+        cls,
+        checkpoint_path: str,
+        model_name_or_path: str = "mistralai/Mistral-7B-Instruct-v0.2",
+        lora_r: int = 128,
+        lora_alpha: int = 16,
+        num_latent: int = 5,
+        use_prj: bool = False,
+        prj_dim: int = 2048,
+        prj_dropout: float = 0.0,
+        prj_no_ln: bool = False,
+        remove_eos: bool = False,
+        model_max_length: int = 28000,
+        attn_implementation: str = "flash_attention_2",
+        full_precision: bool = True,
+        device: str = "cuda",
+        dtype: str = "bfloat16",
+        token: Optional[str] = None,
+        strict: bool = False,
+        checkpoint_save_path: Optional[str] = None,
+    ):
+        """
+        Load a pretrained CODI model from a checkpoint.
+
+        Args:
+            checkpoint_path: Fine-tuned checkpoint. Can be either:
+                - Local path to directory containing model.safetensors or pytorch_model.bin
+                - HuggingFace model ID where the checkpoint is stored
+            model_name_or_path: Base model (e.g., "mistralai/Mistral-7B-Instruct-v0.2" or "meta-llama/Llama-2-7b").
+                Can be either:
+                - A HuggingFace model ID (uses default HF cache ~/.cache/huggingface/)
+                - A local path to a saved base model
+            lora_r: LoRA rank
+            lora_alpha: LoRA alpha parameter
+            num_latent: Number of latent reasoning iterations during training
+            use_prj: Whether to use projection module
+            prj_dim: Projection module hidden dimension
+            prj_dropout: Projection module dropout
+            prj_no_ln: Remove LayerNorm from projection module
+            remove_eos: Do not add <eos> as delimiter
+            model_max_length: Maximum sequence length
+            attn_implementation: Attention implementation ("flash_attention_2", "eager", etc.)
+            full_precision: Use full precision (bf16/fp16) vs quantized (4-bit)
+            device: Device to load model on ("cuda" or "cpu")
+            dtype: Data type ("bfloat16" or "float16")
+            token: HuggingFace token for private models
+            strict: Whether to strictly enforce state_dict loading
+            checkpoint_save_path: Optional path to save the checkpoint if downloading from HF.
+                If None and checkpoint_path is a HF ID, will save to "./checkpoints/{checkpoint_name}"
+
+        Returns:
+            CODI model with loaded weights
+        """
+        # Step 1: Handle base model (model_name_or_path)
+        # Base model uses standard HuggingFace caching - no custom handling needed
+        # It will be downloaded to ~/.cache/huggingface/ automatically if it's a HF ID
+        print(f"Base model: {model_name_or_path}")
+        if not os.path.exists(model_name_or_path):
+            print(f"  → Will be downloaded from HuggingFace (cached in ~/.cache/huggingface/)")
+        else:
+            print(f"  → Loading from local path")
+
+        # Create model arguments
+        model_args = ModelArguments(
+            model_name_or_path=model_name_or_path,
+            lora_r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_init=True,
+            full_precision=full_precision,
+            attn_implementation=attn_implementation,
+            train=False,  # Inference mode
+            token=token,
+        )
+
+        # Create training arguments
+        bf16 = dtype == "bfloat16"
+        training_args = TrainingArguments(
+            output_dir="./output",  # Dummy, not used for inference
+            model_max_length=model_max_length,
+            num_latent=num_latent,
+            use_lora=True,
+            use_prj=use_prj,
+            prj_dim=prj_dim,
+            prj_dropout=prj_dropout,
+            prj_no_ln=prj_no_ln,
+            remove_eos=remove_eos,
+            bf16=bf16,
+        )
+
+        # Determine target modules based on model architecture
+        if any(
+            name in model_name_or_path.lower()
+            for name in ["llama", "mistral", "falcon", "qwen"]
+        ):
+            target_modules = [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "up_proj",
+                "down_proj",
+                "gate_proj",
+            ]
+        elif any(name in model_name_or_path.lower() for name in ["phi"]):
+            target_modules = ["q_proj", "k_proj", "v_proj", "dense", "fc1", "fc2"]
+        elif any(name in model_name_or_path.lower() for name in ["gpt2"]):
+            target_modules = ["c_attn", "c_proj", "c_fc"]
+        else:
+            raise ValueError(
+                f"Unsupported model architecture: {model_name_or_path}. "
+                f"Supported: LLAMA, Mistral, Falcon, Qwen, Phi, GPT-2"
+            )
+
+        # Create LoRA config
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=True,
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=0.1,
+            target_modules=target_modules,
+            init_lora_weights=True,
+        )
+
+        # Initialize model
+        model = cls(model_args, training_args, lora_config)
+
+        # Step 2: Handle checkpoint (checkpoint_path)
+        # Check if checkpoint_path is a HuggingFace ID or local path
+        is_hf_checkpoint = not os.path.exists(checkpoint_path)
+
+        checkpoint_file = None
+        if is_hf_checkpoint:
+            # Download checkpoint from HuggingFace to a specific local path
+            print(f"Checkpoint: {checkpoint_path} (HuggingFace ID)")
+
+            if checkpoint_save_path is None:
+                # Create default save path
+                checkpoint_name_clean = checkpoint_path.replace("/", "_")
+                checkpoint_save_path = os.path.join("./checkpoints", checkpoint_name_clean)
+
+            print(f"  → Downloading to: {checkpoint_save_path}")
+
+            from huggingface_hub import snapshot_download
+
+            # Download the entire checkpoint directory to the specified path
+            local_checkpoint_path = snapshot_download(
+                repo_id=checkpoint_path,
+                token=token,
+                allow_patterns=["*.safetensors", "*.bin", "*.json"],
+                local_dir=checkpoint_save_path,
+                local_dir_use_symlinks=False,  # Download actual files, not symlinks
+            )
+            print(f"  → Checkpoint saved to: {local_checkpoint_path}")
+            checkpoint_path = local_checkpoint_path
+        else:
+            print(f"Checkpoint: {checkpoint_path} (local path)")
+
+        # Load checkpoint from local path
+        if os.path.exists(os.path.join(checkpoint_path, "model.safetensors")):
+            checkpoint_file = os.path.join(checkpoint_path, "model.safetensors")
+            state_dict = load_file(checkpoint_file)
+        elif os.path.exists(os.path.join(checkpoint_path, "pytorch_model.bin")):
+            checkpoint_file = os.path.join(checkpoint_path, "pytorch_model.bin")
+            state_dict = torch.load(checkpoint_file, map_location="cpu")
+        else:
+            raise FileNotFoundError(
+                f"No checkpoint found in {checkpoint_path}. "
+                f"Looking for 'model.safetensors' or 'pytorch_model.bin'"
+            )
+
+        print(f"Loading checkpoint from {checkpoint_file}")
+        model.load_state_dict(state_dict, strict=strict)
+        model.codi.tie_weights()
+
+        # Move to device and set dtype
+        if device == "cuda" and torch.cuda.is_available():
+            model = model.to(device)
+            if dtype == "bfloat16":
+                model = model.to(torch.bfloat16)
+            else:
+                model = model.to(torch.float16)
+        elif device == "cpu":
+            model = model.to("cpu")
+
+        model.eval()
+        print(f"Model loaded successfully from {checkpoint_path}")
+
+        return model
+
     def __init__(self, model_args, training_args, lora_config):
         super().__init__()
         self.model_args = model_args
@@ -557,3 +750,216 @@ class CODI(torch.nn.Module):
             "distill_loss": distill_loss_total,
             "ref_ce_loss": ref_ce_loss,
         }
+
+    def generate(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.LongTensor] = None,
+        tokenizer: Optional[transformers.PreTrainedTokenizer] = None,
+        max_new_tokens: int = 256,
+        num_latent_iterations: int = 1,
+        temperature: float = 0.1,
+        top_k: int = 40,
+        top_p: float = 0.95,
+        greedy: bool = False,
+        return_latent_vectors: bool = True,
+        remove_eos: bool = False,
+    ):
+        """
+        Generate text with latent reasoning steps.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, seq_len)
+            attention_mask: Optional attention mask of shape (batch_size, seq_len)
+            tokenizer: Tokenizer for decoding. If None, uses self.tokenizer
+            max_new_tokens: Maximum number of tokens to generate
+            num_latent_iterations: Number of latent reasoning iterations
+            temperature: Sampling temperature
+            top_k: Top-k sampling parameter
+            top_p: Top-p (nucleus) sampling parameter
+            greedy: Whether to use greedy decoding
+            return_latent_vectors: Whether to return latent reasoning vectors
+            remove_eos: Whether to remove EOS token when adding BOT/EOT tokens
+
+        Returns:
+            dict with keys:
+                - 'sequences': Generated token IDs of shape (batch_size, generated_length)
+                - 'latent_vectors': List of latent reasoning vectors if return_latent_vectors=True
+                  Each element is a tensor of shape (batch_size, 1, hidden_dim)
+        """
+        if tokenizer is None:
+            tokenizer = self.tokenizer
+
+        device = input_ids.device
+        batch_size = input_ids.size(0)
+
+        # Create attention mask if not provided
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+
+        # Add BOT token to input
+        if remove_eos:
+            bot_tensor = torch.tensor([self.bot_id], dtype=torch.long, device=device).expand(
+                batch_size, 1
+            )
+        else:
+            bot_tensor = torch.tensor(
+                [tokenizer.eos_token_id, self.bot_id], dtype=torch.long, device=device
+            ).expand(batch_size, 2)
+
+        input_ids = torch.cat((input_ids, bot_tensor), dim=1)
+        attention_mask = torch.cat(
+            (attention_mask, torch.ones_like(bot_tensor, device=device)), dim=1
+        )
+
+        latent_vectors = []
+
+        with torch.no_grad():
+            # Encode the input
+            past_key_values = None
+            outputs = self.codi(
+                input_ids=input_ids,
+                use_cache=True,
+                output_hidden_states=True,
+                past_key_values=past_key_values,
+                attention_mask=attention_mask,
+            )
+            past_key_values = outputs.past_key_values
+            latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+
+            if self.use_prj:
+                latent_embd = self.prj(latent_embd)
+
+            if return_latent_vectors:
+                latent_vectors.append(latent_embd.clone())
+
+            # Latent reasoning iterations
+            for i in range(num_latent_iterations):
+                outputs = self.codi(
+                    inputs_embeds=latent_embd,
+                    use_cache=True,
+                    output_hidden_states=True,
+                    past_key_values=past_key_values,
+                )
+                past_key_values = outputs.past_key_values
+                latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+
+                if self.use_prj:
+                    latent_embd = self.prj(latent_embd)
+
+                if return_latent_vectors:
+                    latent_vectors.append(latent_embd.clone())
+
+            # Add EOT token embeddings
+            if remove_eos:
+                eot_emb = (
+                    self.get_embd(self.codi, self.model_name)(
+                        torch.tensor([self.eot_id], dtype=torch.long, device=device)
+                    )
+                    .unsqueeze(0)
+                    .to(device)
+                )
+            else:
+                eot_emb = (
+                    self.get_embd(self.codi, self.model_name)(
+                        torch.tensor(
+                            [self.eot_id, tokenizer.eos_token_id],
+                            dtype=torch.long,
+                            device=device,
+                        )
+                    )
+                    .unsqueeze(0)
+                    .to(device)
+                )
+
+            eot_emb = eot_emb.expand(batch_size, -1, -1)
+            output_emb = eot_emb
+
+            # Generate tokens
+            finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            generated_tokens = [[] for _ in range(batch_size)]
+
+            for step in range(max_new_tokens):
+                out = self.codi(
+                    inputs_embeds=output_emb,
+                    output_hidden_states=False,
+                    attention_mask=None,
+                    use_cache=True,
+                    output_attentions=False,
+                    past_key_values=past_key_values,
+                )
+                past_key_values = out.past_key_values
+                logits = out.logits[:, -1, : self.codi.config.vocab_size - 1]
+
+                # Sampling
+                if greedy:
+                    next_token_ids = torch.argmax(logits, dim=-1).squeeze(-1)
+                else:
+                    logits = logits / temperature
+
+                    # Top-k filtering
+                    if top_k > 1:
+                        top_k_values, _ = torch.topk(logits, top_k, dim=-1)
+                        min_top_k_value = top_k_values[:, -1].unsqueeze(-1)
+                        logits[logits < min_top_k_value] = -float("inf")
+
+                    # Top-p filtering
+                    if top_p < 1.0:
+                        sorted_logit, sorted_indices = torch.sort(
+                            logits, descending=True, dim=-1
+                        )
+                        cumulative_probs = torch.cumsum(
+                            F.softmax(sorted_logit, dim=-1), dim=-1
+                        )
+
+                        sorted_indices_to_remove = cumulative_probs > top_p
+                        if sorted_indices_to_remove.any():
+                            sorted_indices_to_remove = sorted_indices_to_remove.roll(
+                                1, dims=-1
+                            )
+                            sorted_indices_to_remove[:, 0] = False
+
+                        for b in range(batch_size):
+                            logits[
+                                b, sorted_indices[b, sorted_indices_to_remove[b]]
+                            ] = -float("inf")
+
+                    probs = F.softmax(logits, dim=-1)
+                    next_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+                # Track generated tokens
+                for b in range(batch_size):
+                    if not finished[b]:
+                        generated_tokens[b].append(next_token_ids[b].item())
+                        if next_token_ids[b] == tokenizer.eos_token_id:
+                            finished[b] = True
+
+                # Break if all sequences finished
+                if finished.all():
+                    break
+
+                # Get embeddings for next iteration
+                output_emb = (
+                    self.get_embd(self.codi, self.model_name)(next_token_ids)
+                    .unsqueeze(1)
+                    .to(device)
+                )
+
+        # Convert generated tokens to tensor
+        max_len = max(len(seq) for seq in generated_tokens)
+        sequences = torch.full(
+            (batch_size, max_len),
+            tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
+            dtype=torch.long,
+            device=device,
+        )
+
+        for b, tokens in enumerate(generated_tokens):
+            sequences[b, : len(tokens)] = torch.tensor(tokens, dtype=torch.long)
+
+        result = {"sequences": sequences}
+
+        if return_latent_vectors:
+            result["latent_vectors"] = latent_vectors
+
+        return result

@@ -12,25 +12,16 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-import argparse
-import json
 import logging
 import math
 import os
 import re
-import sys
 
 import torch
 import transformers
-import yaml
-from dotenv import load_dotenv
-from torch.nn import functional as F
-
-# Load environment variables from .env file
-load_dotenv()
-
 from peft import LoraConfig, TaskType
 from safetensors.torch import load_file
+from torch.nn import functional as F
 
 from datasets import concatenate_datasets, load_dataset
 from src.model import (
@@ -120,24 +111,25 @@ def evaluation(model_args, data_args, training_args):
     logging.warning("Downloading Data")
     question_name = "question"
     answer_name = "answer"
-    if "gsm-hard" == data_args.data_names:
+    print(data_args)
+    if "gsm-hard" == data_args.data_names[0]:
         dataset = load_dataset("juyoung-trl/gsm-hard")
         test_set = dataset["train"]
         question_name = "instruction"
         answer_name = "response"
-    elif "multi-arith" == data_args.data_names:
+    elif "multi-arith" == data_args.data_names[0]:
         dataset = load_dataset("ChilleD/MultiArith")
         test_set = dataset["test"]
         answer_name = "final_ans"
-    elif "svamp" == data_args.data_names:
+    elif "svamp" == data_args.data_names[0]:
         dataset = load_dataset("ChilleD/SVAMP")
         test_set = concatenate_datasets([dataset["train"], dataset["test"]])
         question_name = "question_concat"
         answer_name = "Answer"
-    elif "commonsense" == data_args.data_names:
+    elif "commonsense" == data_args.data_names[0]:
         dataset = load_dataset("zen-E/CommonsenseQA-GPT4omini")
         test_set = dataset["validation"]
-    elif "gsm8k" == data_args.data_names:
+    elif "gsm8k" == data_args.data_names[0]:
         dataset = load_dataset("gsm8k", "main")
         test_set = dataset["test"]
     else:
@@ -366,10 +358,8 @@ def evaluation(model_args, data_args, training_args):
                 )
 
             for mini_step, pred_token in enumerate(pred_tokens):
-                print(f"{pred_token=}")
                 len_cot.append(len(pred_token))
                 decoded_pred = tokenizer.decode(pred_token, skip_special_tokens=True)
-                print(f"{decoded_pred=}")
                 # Extract the numbers in sentences
                 if do_print:
                     print(
@@ -379,10 +369,10 @@ def evaluation(model_args, data_args, training_args):
                     print(decoded_pred)
                     print(f"Question {step * data_args.batch_size + mini_step} Ends")
                     print(
-                        f"Prediction={extract_answer_number(decoded_pred, data_args)}; Groundtruth={answer[step * data_args.batch_size + mini_step]}"
+                        f"Prediction={extract_answer_number(decoded_pred)}; Groundtruth={answer[step * data_args.batch_size + mini_step]}"
                     )
                     print("")
-                ans_pred_list.append(extract_answer_number(decoded_pred, data_args))
+                ans_pred_list.append(extract_answer_number(decoded_pred))
 
     accuracy = compute_accuracy(answer, ans_pred_list)
 
@@ -394,18 +384,18 @@ def evaluation(model_args, data_args, training_args):
     return 100 * accuracy
 
 
-def extract_answer_number(sentence: str, data_args) -> float:
+def extract_answer_number(sentence: str) -> float:
     sentence = sentence.replace(",", "")
     pred = [s for s in re.findall(r"-?\d+\.?\d*", sentence)]
     if not pred:
-        if "commonsense" in data_args.data_names:
+        if "commonsense" in data_args.data_names[0]:
             pred = sentence.split("The answer is:")[-1].strip()
-            if pred and pred[0] not in "ABCDE":
+            if pred[0] not in "ABCDE":
                 return "C"
-            return pred[0] if pred else "C"
+            return pred[0]
         elif (
-            "strategy" in data_args.data_names
-            or "prontoqa" in data_args.data_names.lower()
+            "strategy" in data_args.data_names[0]
+            or "prontoqa" in data_args.data_names[0].lower()
         ):
             if "True" in sentence:
                 return True
@@ -435,70 +425,10 @@ def compute_accuracy(gold: list, pred: list):
 
 
 if __name__ == "__main__":
-    # Support config file as positional argument or --config_file flag
-    # Check if first argument (after script name) looks like a config file
-    config_path = None
-    if len(sys.argv) > 1:
-        first_arg = sys.argv[1]
-        # Check if it's a config file (not a flag and has config extension)
-        if not first_arg.startswith("-") and (
-            first_arg.endswith(".yaml")
-            or first_arg.endswith(".yml")
-            or first_arg.endswith(".json")
-        ):
-            config_path = first_arg
-            # Remove it from sys.argv so HfArgumentParser doesn't see it
-            sys.argv.pop(1)
-
-    # Also check for --config_file flag
-    arg_parser = argparse.ArgumentParser(description="Test CODI model", add_help=False)
-    arg_parser.add_argument(
-        "--config_file", type=str, default=None, help="Path to JSON or YAML config file"
+    parser = transformers.HfArgumentParser(
+        (ModelArguments, DataArguments, TrainingArguments)
     )
-    config_args, remaining_args = arg_parser.parse_known_args()
-
-    # Use --config_file flag if provided, otherwise use positional argument we found
-    config_path = config_args.config_file or config_path
-
-    if config_path:
-        # Remove --config_file and its value from sys.argv if present
-        if "--config_file" in sys.argv:
-            idx = sys.argv.index("--config_file")
-            sys.argv.pop(idx)  # Remove --config_file
-            if idx < len(sys.argv) and not sys.argv[idx].startswith("-"):
-                sys.argv.pop(idx)  # Remove config file path
-
-        # Load config file
-        if config_path.endswith(".yaml") or config_path.endswith(".yml"):
-            with open(config_path, "r") as f:
-                config = yaml.safe_load(f)
-        elif config_path.endswith(".json"):
-            with open(config_path, "r") as f:
-                config = json.load(f)
-        else:
-            raise ValueError(
-                f"Config file must be .json, .yaml, or .yml, got {config_path}"
-            )
-
-        # Create dataclass instances from config
-        model_config = config.get("model_args", {})
-        # Use environment variable for token if not provided in config
-        if model_config.get("token") is None:
-            model_config["token"] = os.getenv("HF_TOKEN") or os.getenv(
-                "HUGGINGFACE_TOKEN"
-            )
-        model_args = ModelArguments(**model_config)
-        data_args = DataArguments(**config.get("data_args", {}))
-
-        # TrainingArguments needs special handling
-        training_config = config.get("training_args", {})
-        training_args = TrainingArguments(**training_config)
-    else:
-        # Use HfArgumentParser for command-line arguments
-        parser = transformers.HfArgumentParser(
-            (ModelArguments, DataArguments, TrainingArguments)
-        )
-        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     accu_list = []
     for i in range(training_args.inf_num_iterations):

@@ -1,8 +1,8 @@
-python test.py \
-	--data_name "gsm8k" \
+python test_original.py \
+	--data_names "gsm8k" \
 	--output_dir "$SAVE_DIR" \
 	--model_name_or_path gpt2 \
-	--seed 11 \
+	--seed 10 \
 	--model_max_length 512 \
 	--bf16 \
 	--lora_r 128 --lora_alpha 32 --lora_init \
@@ -17,4 +17,4 @@ python test.py \
 	--inf_num_iterations 1 \
 	--remove_eos True \
 	--use_lora True \
-	--ckpt_dir ~/transfer/codi_gpt2
+	--ckpt_dir /workspace/projects/codi/models/CODI-gpt2

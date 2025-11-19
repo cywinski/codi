@@ -1,12 +1,12 @@
+import os
 from dataclasses import dataclass, field
 from typing import Optional
-import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
-from peft import get_peft_model, LoraConfig, TaskType
+from peft import LoraConfig, TaskType, get_peft_model
 from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -19,10 +19,6 @@ class ModelArguments:
     lora_dropout: float = field(default=0.05, metadata={"help": "lora dropout"})
     full_precision: bool = field(
         default=True, metadata={"help": "whether use int4 for the base model"}
-    )
-    attn_implementation: str = field(
-        default="flash_attention_2",
-        metadata={"help": "attention implementation"},
     )
     train: bool = field(
         default=True,
@@ -57,7 +53,7 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
-    data_names: list = field(
+    data_names: list[str] = field(
         default_factory=list,
         metadata={"help": "List of dataset names to concatenate for training."},
     )
@@ -68,12 +64,6 @@ class DataArguments:
         },
     )
     batch_size: int = field(default=1, metadata={"help": "batch size during inference"})
-    max_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": "Maximum number of samples to use from the dataset. If None, use all samples."
-        },
-    )
 
 
 @dataclass
@@ -251,9 +241,11 @@ class CODI(torch.nn.Module):
         # It will be downloaded to ~/.cache/huggingface/ automatically if it's a HF ID
         print(f"Base model: {model_name_or_path}")
         if not os.path.exists(model_name_or_path):
-            print(f"  → Will be downloaded from HuggingFace (cached in ~/.cache/huggingface/)")
+            print(
+                "  → Will be downloaded from HuggingFace (cached in ~/.cache/huggingface/)"
+            )
         else:
-            print(f"  → Loading from local path")
+            print("  → Loading from local path")
 
         # Create model arguments
         model_args = ModelArguments(
@@ -262,7 +254,7 @@ class CODI(torch.nn.Module):
             lora_alpha=lora_alpha,
             lora_init=True,
             full_precision=full_precision,
-            attn_implementation=attn_implementation,
+            # attn_implementation=attn_implementation,
             train=False,  # Inference mode
             token=token,
         )
@@ -332,7 +324,9 @@ class CODI(torch.nn.Module):
             if checkpoint_save_path is None:
                 # Create default save path
                 checkpoint_name_clean = checkpoint_path.replace("/", "_")
-                checkpoint_save_path = os.path.join("./checkpoints", checkpoint_name_clean)
+                checkpoint_save_path = os.path.join(
+                    "./checkpoints", checkpoint_name_clean
+                )
 
             print(f"  → Downloading to: {checkpoint_save_path}")
 
@@ -389,22 +383,21 @@ class CODI(torch.nn.Module):
         self.training_args = training_args
         self.model_name = model_args.model_name_or_path
         model_wrapper_class = AutoModelForCausalLM
-
-        # Store the dtype for later use
-        self.dtype = torch.float16 if training_args.bf16 is False else torch.bfloat16
-
         if model_args.full_precision:
             self.codi = model_wrapper_class.from_pretrained(
                 self.model_name,
-                torch_dtype=self.dtype,
-                attn_implementation=model_args.attn_implementation,
+                torch_dtype=(
+                    torch.float16 if training_args.bf16 is False else torch.bfloat16
+                ),
+                resume_download=True,
             )
         else:
             self.codi = model_wrapper_class.from_pretrained(
                 self.model_name,
-                torch_dtype=self.dtype,
-                attn_implementation=model_args.attn_implementation,
-                device_map="auto",
+                torch_dtype=(
+                    torch.float16 if training_args.bf16 is False else torch.bfloat16
+                ),
+                resume_download=True,
                 quantization_config=transformers.BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_compute_dtype=torch.bfloat16,
@@ -421,17 +414,9 @@ class CODI(torch.nn.Module):
         self.bot_id = ori_vocab_size + 1
         self.eot_id = ori_vocab_size + 2
 
-        # Resize embeddings (only for full precision models, quantized models are already on device)
-        if model_args.full_precision:
-            self.codi.resize_token_embeddings(
-                ori_vocab_size + 3, mean_resizing=False
-            )  # dummy values for mem tokens
-            # Move to GPU after resizing embeddings
-            if torch.cuda.is_available():
-                self.codi = self.codi.to("cuda")
-        else:
-            # For quantized models, resize is handled differently
-            self.codi.resize_token_embeddings(ori_vocab_size + 3, mean_resizing=False)
+        self.codi.resize_token_embeddings(
+            ori_vocab_size + 3
+        )  # dummy values for mem tokens
 
         self.dim = self.codi.config.hidden_size
         self.num_latent = training_args.num_latent
@@ -453,10 +438,6 @@ class CODI(torch.nn.Module):
             )
             if not self.prj_no_ln:
                 self.prj.add_module("ln", nn.LayerNorm(self.dim))
-            # Cast projection layer to the correct dtype and device
-            self.prj = self.prj.to(dtype=self.dtype)
-            if torch.cuda.is_available() and model_args.full_precision:
-                self.prj = self.prj.to("cuda")
 
         # Losses
         self.print_loss = training_args.print_loss
@@ -558,8 +539,6 @@ class CODI(torch.nn.Module):
         )  # as the next input
         if self.use_prj:
             latent_embd = self.prj(latent_embd)
-        # Ensure latent embeddings are in the correct dtype
-        latent_embd = latent_embd.to(self.dtype)
 
         len_pred_loss = 0
         dynamic_mask = None
@@ -584,7 +563,6 @@ class CODI(torch.nn.Module):
             output_hidden_states=True,
             attention_mask=ref_attention_mask,
         )
-        # ref_outputs = ref_outputs_with_grad
 
         # Formatting for deprecated exps
         ref_outputs_list = [ref_outputs]
@@ -643,15 +621,11 @@ class CODI(torch.nn.Module):
                 latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
                 if self.use_prj:
                     latent_embd = self.prj(latent_embd)
-                # Ensure latent embeddings are in the correct dtype
-                latent_embd = latent_embd.to(self.dtype)
 
                 # Calculate the distillation loss
                 if i == num_latent - 1:  # the last latent embedding
                     # Decode the final answer in natural language
                     embds = self.get_embd(self.codi, self.model_name)(decoder_input_ids)
-                    # Ensure embeddings are in the correct dtype
-                    embds = embds.to(self.dtype)
 
                     if dynamic_mask is not None:  # Prevent attending the paddings
                         decoder_mask = torch.ones(
@@ -799,9 +773,9 @@ class CODI(torch.nn.Module):
 
         # Add BOT token to input
         if remove_eos:
-            bot_tensor = torch.tensor([self.bot_id], dtype=torch.long, device=device).expand(
-                batch_size, 1
-            )
+            bot_tensor = torch.tensor(
+                [self.bot_id], dtype=torch.long, device=device
+            ).expand(batch_size, 1)
         else:
             bot_tensor = torch.tensor(
                 [tokenizer.eos_token_id, self.bot_id], dtype=torch.long, device=device
@@ -811,6 +785,7 @@ class CODI(torch.nn.Module):
         attention_mask = torch.cat(
             (attention_mask, torch.ones_like(bot_tensor, device=device)), dim=1
         )
+        print(tokenizer.convert_ids_to_tokens(input_ids[0]))
 
         latent_vectors = []
 
@@ -895,7 +870,7 @@ class CODI(torch.nn.Module):
                 if greedy:
                     next_token_ids = torch.argmax(logits, dim=-1).squeeze(-1)
                 else:
-                    logits = logits / temperature
+                    logits /= temperature
 
                     # Top-k filtering
                     if top_k > 1:
@@ -919,13 +894,17 @@ class CODI(torch.nn.Module):
                             )
                             sorted_indices_to_remove[:, 0] = False
 
-                        for b in range(batch_size):
+                        for b in range(logits.size(0)):
                             logits[
                                 b, sorted_indices[b, sorted_indices_to_remove[b]]
                             ] = -float("inf")
 
                     probs = F.softmax(logits, dim=-1)
                     next_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+                # Ensure next_token_ids has at least 1 dimension for indexing
+                if next_token_ids.dim() == 0:
+                    next_token_ids = next_token_ids.unsqueeze(0)
 
                 # Track generated tokens
                 for b in range(batch_size):

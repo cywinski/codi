@@ -1,7 +1,7 @@
-python test.py \
-	--data_name "gsm8k" \
+python test_original.py \
+	--data_names "gsm8k" \
 	--output_dir "$SAVE_DIR" \
-	--model_name_or_path meta-llama/Llama-3.2-1B \
+	--model_name_or_path meta-llama/Llama-3.2-1B-Instruct \
 	--seed 11 \
 	--model_max_length 512 \
 	--bf16 \
@@ -17,4 +17,4 @@ python test.py \
 	--inf_num_iterations 1 \
 	--remove_eos True \
 	--use_lora True \
-	--ckpt_dir ~/codi_ckpt/codi_nl_llama/gsm8k_llama1b_latent_baseline/Llama-3.2-1B/ep_3/lr_0.0008/seed_11/
+	--ckpt_dir /workspace/projects/codi/models/codi_llama1b_orig

@@ -13,8 +13,8 @@ load_dotenv()
 
 # %%
 model = CODI.from_pretrained(
-    checkpoint_path="zen-E/CODI-gpt2",  # HF checkpoint ID
-    model_name_or_path="gpt2",  # HF base model ID
+    checkpoint_path="bcywinski/codi_llama1b_gsm8k-strategyqa-commonsense",  # HF checkpoint ID
+    model_name_or_path="meta-llama/Llama-3.2-1B-Instruct",  # HF base model ID
     lora_r=128,
     lora_alpha=32,
     num_latent=6,  # Number of latent reasoning steps
@@ -23,7 +23,9 @@ model = CODI.from_pretrained(
     dtype="bfloat16",
     strict=False,
     # Optional: specify where to save the checkpoint (default: ./checkpoints/{name})
-    checkpoint_save_path="./models/codi_gpt2",
+    checkpoint_save_path="./checkpoints/bcywinski_codi_llama1b_gsm8k-strategyqa-commonsense",
+    remove_eos=True,
+    full_precision=True,
 )
 # %%
 # Load tokenizer
@@ -42,7 +44,7 @@ tokenizer.eot_id = tokenizer.convert_tokens_to_ids("<|eot|>")
 
 # %%
 # Tokenize input
-prompt = "Mark's car breaks down and he needs to get a new radiator. The cost for a new radiator is $400 but he goes to get it at a junk shop and gets it for 80% off. He then hires a mechanic to install it and it takes 3 hours at $50 an hour. How much did he pay?"
+prompt = "Jenny buys 1 bag of cookies a week. The bag has 36 cookies and she puts 4 cookies in her son's lunch box 5 days a week. Her husband eats 1 cookie a day for 7 days. Jenny eats the rest of the cookies. How many cookies does Jenny eat?"
 inputs = tokenizer(prompt, return_tensors="pt", padding=True)
 input_ids = inputs["input_ids"].to(model.codi.device)
 attention_mask = inputs["attention_mask"].to(model.codi.device)
@@ -75,8 +77,6 @@ latent_vectors = torch.stack(output["latent_vectors"]).squeeze(1).squeeze(1).to(
 latent_vectors.shape
 # %%
 embed_matrix = model.codi.model.model.embed_tokens.weight.to("cpu")
-# embed_matrix = model.codi.base_model.model.transformer.wte.weight.to("cpu")
-
 # %%
 sims = latent_vectors @ embed_matrix.T
 sims.shape
@@ -88,7 +88,11 @@ for i in range(sims.shape[0]):
     topk = sims[i].topk(k, dim=-1)
     topk_indices = topk.indices.tolist()
     topk_values = topk.values.tolist()
-    for j, value in zip(topk_indices, topk_values):
-        print(tokenizer.convert_ids_to_tokens(torch.tensor(j).tolist()), value)
-    print("-" * 100)
+    print(f"\nLatent vector #{i + 1}:")
+    print(f"{'Rank':<5} {'Token':<20} {'ID':<6} {'Similarity':<10}")
+    print("-" * 50)
+    for rank, (j, value) in enumerate(zip(topk_indices, topk_values), 1):
+        token_str = tokenizer.convert_ids_to_tokens([j])[0]
+        print(f"{rank:<5} {token_str:<20} {j:<6} {value:<10.6f}")
+    print("-" * 50)
 # %%

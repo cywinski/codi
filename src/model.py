@@ -805,6 +805,8 @@ class CODI(torch.nn.Module):
             past_key_values = outputs.past_key_values
             latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
 
+            if return_latent_vectors:
+                latent_vectors.append(latent_embd.clone())
             if self.use_prj:
                 latent_embd = self.prj(latent_embd)
                 latent_embd = latent_embd.to(
@@ -831,6 +833,9 @@ class CODI(torch.nn.Module):
                     )  # FIX: layer norm casts to fp32
                 if return_latent_vectors:
                     latent_vectors.append(latent_embd.clone())
+
+                if self.use_prj:
+                    latent_embd = self.prj(latent_embd)
 
             # Add EOT token embeddings
             if remove_eos:

@@ -18,7 +18,7 @@ data_args:
 # Wandb Arguments
 wandb:
   project: "codi"
-  run_name: "codi_llama1b_gsm8k-strategyqa-commonsense"
+  run_name: "codi_llama1b_gsm8k-strategyqa-commonsense2"
 
 # Hub Arguments
 hub:
@@ -28,9 +28,9 @@ hub:
 
 # Training Arguments
 training_args:
-  output_dir: "./models/codi_llama1b_gsm8k-strategyqa-commonsense"
-  expt_name: "codi_llama1b_gsm8k-strategyqa-commonsense"
-  logging_dir: "./models/codi_llama1b_gsm8k-strategyqa-commonsense/logs"
+  output_dir: "./models/codi_llama1b_gsm8k-strategyqa-commonsense2"
+  expt_name: "codi_llama1b_gsm8k-strategyqa-commonsense2"
+  logging_dir: "./models/codi_llama1b_gsm8k-strategyqa-commonsense2/logs"
   logging_steps: 10
   seed: 11
   model_max_length: 512
@@ -38,7 +38,7 @@ training_args:
   gradient_accumulation_steps: 1
   bf16: true
   max_steps: -1
-  num_train_epochs: 5
+  num_train_epochs: 3
   learning_rate: 8e-4
   max_grad_norm: 2.0
   save_strategy: "epoch"

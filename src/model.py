@@ -381,22 +381,19 @@ class CODI(torch.nn.Module):
         super().__init__()
         self.model_args = model_args
         self.training_args = training_args
+        target_dtype = torch.float16 if training_args.bf16 is False else torch.bfloat16
         self.model_name = model_args.model_name_or_path
         model_wrapper_class = AutoModelForCausalLM
         if model_args.full_precision:
             self.codi = model_wrapper_class.from_pretrained(
                 self.model_name,
-                torch_dtype=(
-                    torch.float16 if training_args.bf16 is False else torch.bfloat16
-                ),
+                torch_dtype=target_dtype,
                 resume_download=True,
             )
         else:
             self.codi = model_wrapper_class.from_pretrained(
                 self.model_name,
-                torch_dtype=(
-                    torch.float16 if training_args.bf16 is False else torch.bfloat16
-                ),
+                torch_dtype=target_dtype,
                 resume_download=True,
                 quantization_config=transformers.BitsAndBytesConfig(
                     load_in_4bit=True,
@@ -438,6 +435,7 @@ class CODI(torch.nn.Module):
             )
             if not self.prj_no_ln:
                 self.prj.add_module("ln", nn.LayerNorm(self.dim))
+            self.prj = self.prj.to(dtype=target_dtype)
 
         # Losses
         self.print_loss = training_args.print_loss
@@ -464,6 +462,7 @@ class CODI(torch.nn.Module):
             self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
             self.tokenizer.pad_token_id = self.pad_token_id
 
+        self.to(dtype=target_dtype)
         if self.training:
             self.init()
 
@@ -539,6 +538,9 @@ class CODI(torch.nn.Module):
         )  # as the next input
         if self.use_prj:
             latent_embd = self.prj(latent_embd)
+            latent_embd = latent_embd.to(
+                dtype=self.codi.dtype
+            )  # FIX: layer norm casts to fp32
 
         len_pred_loss = 0
         dynamic_mask = None
@@ -621,6 +623,7 @@ class CODI(torch.nn.Module):
                 latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
                 if self.use_prj:
                     latent_embd = self.prj(latent_embd)
+                    latent_embd = latent_embd.to(dtype=self.codi.dtype)
 
                 # Calculate the distillation loss
                 if i == num_latent - 1:  # the last latent embedding
@@ -804,7 +807,9 @@ class CODI(torch.nn.Module):
 
             if self.use_prj:
                 latent_embd = self.prj(latent_embd)
-
+                latent_embd = latent_embd.to(
+                    dtype=self.codi.dtype
+                )  # FIX: layer norm casts to fp32
             if return_latent_vectors:
                 latent_vectors.append(latent_embd.clone())
 
@@ -821,7 +826,9 @@ class CODI(torch.nn.Module):
 
                 if self.use_prj:
                     latent_embd = self.prj(latent_embd)
-
+                    latent_embd = latent_embd.to(
+                        dtype=self.codi.dtype
+                    )  # FIX: layer norm casts to fp32
                 if return_latent_vectors:
                     latent_vectors.append(latent_embd.clone())
 

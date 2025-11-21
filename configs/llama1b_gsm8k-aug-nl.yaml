@@ -11,14 +11,14 @@ model_args:
 data_args:
   data_names:
     - "icot_full"
-    - "strategy"
-    - "commonsense"
+    # - "strategy"
+    # - "commonsense"
   max_samples: null
 
 # Wandb Arguments
 wandb:
   project: "codi"
-  run_name: "codi_llama1b_gsm8k-strategyqa-commonsense2"
+  run_name: "codi_llama1b_gsm8k-aug-nl-direct-ans"
 
 # Hub Arguments
 hub:
@@ -28,9 +28,9 @@ hub:
 
 # Training Arguments
 training_args:
-  output_dir: "./models/codi_llama1b_gsm8k-strategyqa-commonsense2"
-  expt_name: "codi_llama1b_gsm8k-strategyqa-commonsense2"
-  logging_dir: "./models/codi_llama1b_gsm8k-strategyqa-commonsense2/logs"
+  output_dir: "./models/codi_llama1b_gsm8k-aug-nl-direct-ans"
+  expt_name: "codi_llama1b_gsm8k-aug-nl-direct-ans"
+  logging_dir: "./models/codi_llama1b_gsm8k-aug-nl-direct-ans/logs"
   logging_steps: 10
   seed: 11
   model_max_length: 512

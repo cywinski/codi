@@ -70,6 +70,7 @@ class CustomTrainer(Trainer):
                     "ce_loss": outputs["ce_loss"],
                     "distill_loss": outputs["distill_loss"],
                     "ref_ce_loss": outputs["ref_ce_loss"],
+                    "sft_loss": outputs["sft_loss"],
                 }
             )
         return loss
@@ -165,7 +166,6 @@ def train():
             init_lora_weights=True,
         )
 
-    model = CODI(model_args, training_args, lora_config)
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         token=model_args.token,
@@ -174,12 +174,26 @@ def train():
         padding_side="right",
         use_fast=False,
     )
+    print(f"{len(tokenizer)=}")
 
     if tokenizer.pad_token_id is None:
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-        tokenizer.pad_token_id = model.pad_token_id
-        if tokenizer.pad_token_id is None:  # error handling
-            tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("[PAD]")
+        tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("[PAD]")
+
+    # Add extra (non-core) special tokens using 'additional_special_tokens'
+    additional_special_tokens = ["<|vcot|>", "<|lcot|>", "<|eocot|>", "<|ans|>"]
+    tokenizer.add_special_tokens(
+        {"additional_special_tokens": additional_special_tokens}
+    )
+
+    # Optionally assign ids for later convenience
+    tokenizer.vcot_id = tokenizer.convert_tokens_to_ids("<|vcot|>")  # verbalized Cot
+    tokenizer.lcot_id = tokenizer.convert_tokens_to_ids("<|lcot|>")  # latent Cot
+    tokenizer.eot_id = tokenizer.convert_tokens_to_ids("<|eocot|>")  # end of CoT
+    tokenizer.ans_id = tokenizer.convert_tokens_to_ids("<|ans|>")  # answer
+    print(f"{len(tokenizer)=}")
+
+    model = CODI(model_args, training_args, lora_config, tokenizer)
 
     training_args.output_dir = os.path.join(
         training_args.output_dir,
@@ -210,24 +224,13 @@ def train():
     data_module = make_supervised_data_module(
         tokenizer=tokenizer,
         data_args=data_args,
-        model=model,
         training_args=training_args,
     )
     trainer = CustomTrainer(
         model=model, tokenizer=tokenizer, args=training_args, **data_module
     )
     trainer.train()
-
-    # to avoid the error of saving the model
-    # if "llama" in model_args.model_name_or_path:
-    #    trainer.model.codi.model.model.embed_tokens.weight = torch.nn.Parameter(model.codi.model.lm_head.weight.clone())
-    # if "gpt2" in model_args.model_name_or_path:
-    #    trainer.model.codi.transformer.wte.weight = torch.nn.Parameter(model.codi.lm_head.weight.clone())
-    # if "qwen" in model_args.model_name_or_path.lower():
-    #    trainer.model.codi.base_model.model.model.embed_tokens.weight = torch.nn.Parameter(model.codi.base_model.model.lm_head.weight.clone())
-
-    # trainer.save_state()
-    trainer.save_model(output_dir=training_args.output_dir)
+    # trainer.save_model(output_dir=training_args.output_dir)
 
 
 if __name__ == "__main__":

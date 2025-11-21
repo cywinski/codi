@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import transformers
 from peft import LoraConfig, TaskType, get_peft_model
 from safetensors.torch import load_file
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 
 
 @dataclass
@@ -377,7 +377,7 @@ class CODI(torch.nn.Module):
 
         return model
 
-    def __init__(self, model_args, training_args, lora_config):
+    def __init__(self, model_args, training_args, lora_config, tokenizer):
         super().__init__()
         self.model_args = model_args
         self.training_args = training_args
@@ -401,21 +401,22 @@ class CODI(torch.nn.Module):
                 ),
             )
 
-        ori_vocab_size = self.codi.config.vocab_size
+        # ori_vocab_size = self.codi.config.vocab_size
         self.training = self.model_args.train
+        self.tokenizer = tokenizer
 
         # special tokens to enclose the latent embeddings
-        self.pad_token_id = ori_vocab_size
-        self.bot_id = ori_vocab_size + 1
-        self.eot_id = ori_vocab_size + 2
+        self.codi.resize_token_embeddings(len(tokenizer))
+        # self.pad_token_id = ori_vocab_size
+        # self.bot_id = ori_vocab_size + 1
+        # self.eot_id = ori_vocab_size + 2
 
-        self.codi.resize_token_embeddings(
-            ori_vocab_size + 3
-        )  # dummy values for mem tokens
+        # self.codi.resize_token_embeddings(
+        #     ori_vocab_size + 3
+        # )  # dummy values for mem tokens
 
         self.dim = self.codi.config.hidden_size
         self.num_latent = training_args.num_latent
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, use_fast=False)
 
         # LoRA
         if training_args.use_lora:
@@ -456,9 +457,9 @@ class CODI(torch.nn.Module):
         # general
         self.fix_attn_mask = training_args.fix_attn_mask
 
-        if self.tokenizer.pad_token_id is None:
-            self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-            self.tokenizer.pad_token_id = self.pad_token_id
+        # if self.tokenizer.pad_token_id is None:
+        #     self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        #     self.tokenizer.pad_token_id = self.pad_token_id
 
         self.to(dtype=target_dtype)
         if self.training:
@@ -506,7 +507,9 @@ class CODI(torch.nn.Module):
 
     def forward(
         self,
-        encoder_input_ids: torch.LongTensor = None,
+        encoder_input_ids_ans: torch.LongTensor = None,
+        encoder_input_ids_lcot: torch.LongTensor = None,
+        # encoder_input_ids_vcot: torch.LongTensor = None,
         decoder_input_ids: torch.LongTensor = None,
         ref_input_ids: torch.LongTensor = None,
         labels: Optional[torch.LongTensor] = None,
@@ -521,19 +524,19 @@ class CODI(torch.nn.Module):
         if not self.fix_attn_mask:
             ref_attention_mask = None
 
+        # --- Standard pipeline as before ---
+
         # Encode the question
         past_key_values = None
         outputs = self.codi(
-            input_ids=encoder_input_ids,
+            input_ids=encoder_input_ids_lcot,
             use_cache=True,
             output_hidden_states=True,
             past_key_values=past_key_values,
             attention_mask=encoder_attention_mask,
         )
         past_key_values = outputs.past_key_values
-        latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(
-            1
-        )  # as the next input
+        latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
         if self.use_prj:
             latent_embd = self.prj(latent_embd)
             latent_embd = latent_embd.to(
@@ -564,24 +567,13 @@ class CODI(torch.nn.Module):
             attention_mask=ref_attention_mask,
         )
 
-        # Formatting for deprecated exps
         ref_outputs_list = [ref_outputs]
         ref_input_ids = [ref_input_ids]
 
-        # Process the position tensor
-        # Normalise the position definition
-        if (
-            "llama" in self.model_name.lower() or "qwen" in self.model_name.lower()
-        ):  # there is one more token standing for " "
-            model_answer_position = model_answer_position + 1
-            ref_answer_position = ref_answer_position + 1
-
-        # For DEBUG: Print the probability of the teacher task to predict the correct answer
         if self.training_args.print_ref_model_stats:
             for i, (ref_inputs, ref_outputs) in enumerate(
                 zip(ref_input_ids, ref_outputs_list)
             ):
-                # evalutae the reference model
                 if len(ref_outputs_list) > 1:
                     pos = ref_answer_position[i]
                 else:
@@ -602,10 +594,6 @@ class CODI(torch.nn.Module):
                 print(
                     f"stage{i}: mean of the prob of the target token: {ref_probs_of_target.mean()}"
                 )
-
-        # the model answer position is the position of the eot token to predict the first token of the response
-        model_answer_position = model_answer_position - 1
-        ref_answer_position = ref_answer_position - 1
 
         num_latent = self.num_latent
         if self.num_latent != 0:
@@ -700,16 +688,64 @@ class CODI(torch.nn.Module):
         ref_ce_loss = self.loss_fct(effective_ref_logits, ref_target_ids)
         ref_ce_loss *= self.ref_loss_factor
 
+        # ---- SFT loss: model, input is encoder_input_ids_ans + first token of decoder_input_ids, predict the rest ----
+
+        sft_loss = 0.0
+        sft_logits = None
+
+        if (
+            encoder_input_ids_ans is not None
+            and decoder_input_ids is not None
+            and decoder_input_ids.size(1) > 1
+        ):
+            # SFT input: concatenate encoder_input_ids_ans and first decoder token for each sample in batch
+            batch_size = encoder_input_ids_ans.size(0)
+            first_token = decoder_input_ids[:, :1]  # (batch, 1)
+            sft_input_ids = torch.cat(
+                [encoder_input_ids_ans, first_token], dim=1
+            )  # (batch, seq+1)
+
+            # Target: decoder_input_ids[:, 1:]
+            sft_targets = decoder_input_ids[:, 1:]  # (batch, tgt_len)
+            # Mask: for correct loss, will shift sft_logits for ce loss
+
+            # Forward through the model
+            sft_outputs = self.codi(
+                input_ids=sft_input_ids,
+                use_cache=True,
+                output_hidden_states=False,
+                attention_mask=None,  # could add mask if needed
+            )
+            sft_logits = sft_outputs.logits  # (batch, sft_len, vocab)
+            # Only compute loss on the decoder portion
+            # sft_logits for the prediction positions, to predict decoder tokens 1 onwards
+            # Input: [enc ...][<BOS>]; Targets are: <T1> <T2> ... <Tn>
+            # So align sft_logits[:, -tgt_len-1:-1] with sft_targets for loss
+
+            pred_start = sft_logits.size(1) - sft_targets.size(1)
+            sft_pred_logits = sft_logits[
+                :, pred_start:-1, :
+            ]  # skip the last (for alignment)
+            sft_pred_logits = sft_pred_logits.reshape(-1, sft_pred_logits.size(-1))
+            sft_targets_flat = sft_targets[:, :-1].reshape(
+                -1
+            )  # to match sft_pred_logits shape
+
+            sft_loss = self.loss_fct(sft_pred_logits, sft_targets_flat)
+
+        # ----
+
         # Weigh the distillation loss
         distill_loss *= self.distill_loss_factor
         distill_loss_total *= self.distill_loss_factor
 
         if self.print_loss:
             print(
-                f"loss={ce_loss + distill_loss}, ce_loss={ce_loss}, distill_loss={distill_loss}, ce_loss_total={ce_loss_total}, distill_loss_total={distill_loss_total}, ref_ce_loss={ref_ce_loss}"
+                f"loss={ce_loss + distill_loss}, ce_loss={ce_loss}, distill_loss={distill_loss}, ce_loss_total={ce_loss_total}, distill_loss_total={distill_loss_total}, ref_ce_loss={ref_ce_loss}, sft_loss={sft_loss}"
             )
 
-        loss = ce_loss_total + distill_loss_total + ref_ce_loss
+        # Add the new SFT loss to the overall loss
+        loss = ce_loss_total + distill_loss_total + ref_ce_loss + sft_loss
 
         if ce_loss_total != 0:
             ce_loss_total = ce_loss_total.detach().item()
@@ -717,6 +753,8 @@ class CODI(torch.nn.Module):
             distill_loss_total = distill_loss_total.detach().item()
         if ref_ce_loss != 0:
             ref_ce_loss = ref_ce_loss.detach().item()
+        if sft_loss != 0:
+            sft_loss = sft_loss.detach().item()
 
         return {
             "loss": loss,
@@ -724,6 +762,7 @@ class CODI(torch.nn.Module):
             "ce_loss": ce_loss_total,
             "distill_loss": distill_loss_total,
             "ref_ce_loss": ref_ce_loss,
+            "sft_loss": sft_loss,
         }
 
     def generate(
@@ -740,6 +779,7 @@ class CODI(torch.nn.Module):
         return_latent_vectors: bool = True,
         remove_eos: bool = False,
         output_attentions: bool = False,
+        output_hidden_states: bool = False,
         skip_thinking: bool = False,
     ):
         """
@@ -758,7 +798,8 @@ class CODI(torch.nn.Module):
             return_latent_vectors: Whether to return latent reasoning vectors
             remove_eos: Whether to remove EOS token when adding BOT/EOT tokens
             output_attentions: Whether to return attention weights for each generation step
-            latent_embeddings: Optional latent embeddings to use for generation
+            output_hidden_states: Whether to return hidden states computed on the prompt until thinking
+            skip_thinking: Whether to skip the thinking/latent reasoning phase
         Returns:
             dict with keys:
                 - 'sequences': Generated token IDs of shape (batch_size, generated_length)
@@ -766,6 +807,8 @@ class CODI(torch.nn.Module):
                   Each element is a tensor of shape (batch_size, 1, hidden_dim)
                 - 'attentions': List of attention tensors for each generation step if output_attentions=True
                   Each element is a tuple of tensors, one per layer
+                - 'hidden_states': Hidden states computed on the prompt until thinking if output_hidden_states=True
+                  A tuple of tensors, one per layer, each of shape (batch_size, seq_len, hidden_dim)
         """
         if tokenizer is None:
             tokenizer = self.tokenizer
@@ -783,6 +826,7 @@ class CODI(torch.nn.Module):
 
         # First, forward through the input sequence only (excluding bot/eos/BOT)
         past_key_values = None
+        prompt_hidden_states = None
         with torch.no_grad():
             orig_input_len = input_ids.shape[1]  # (batch, seq_len)
 
@@ -794,11 +838,15 @@ class CODI(torch.nn.Module):
             base_outputs = self.codi(
                 input_ids=input_ids_base,
                 use_cache=True,
-                output_hidden_states=True,
+                output_hidden_states=output_hidden_states,
                 past_key_values=None,
                 attention_mask=attention_mask_base,
             )
             past_key_values = base_outputs.past_key_values
+
+            # Store hidden states from prompt processing (until thinking)
+            if output_hidden_states and hasattr(base_outputs, "hidden_states"):
+                prompt_hidden_states = base_outputs.hidden_states
             if not skip_thinking:
                 # Step 3: Now add <bot> (with or without extra eos)
                 if remove_eos:
@@ -997,5 +1045,8 @@ class CODI(torch.nn.Module):
 
         if output_attentions:
             result["attentions"] = attentions_list
+
+        if output_hidden_states and prompt_hidden_states is not None:
+            result["hidden_states"] = prompt_hidden_states
 
         return result

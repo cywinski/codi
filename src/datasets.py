@@ -1,3 +1,4 @@
+## datasets.py
 import json
 import logging
 import re
@@ -11,6 +12,7 @@ from torch.utils.data import Dataset
 from datasets import load_dataset
 
 IGNORE_INDEX = -100
+ANS_TOKEN = "<ans>"  # Define the special answer token
 
 
 def _tokenize_fn(
@@ -66,17 +68,19 @@ def extract_answer_number(sentence: str) -> float:
     return pred_answer
 
 
-def get_answer_token_position(tokens, answer_prompts, tokenizer):
-    # answer_prompt = torch.tensor([464, 3280, 318, 25])
+def get_answer_token_position(tokens, answer_token_id, tokenizer):
+    """
+    Finds the position of the <ans> token in the token sequence.
+    """
     try:
-        match_indices = (
-            (tokens.unfold(0, len(answer_prompts[0]), 1) == answer_prompts[0])
-            .all(dim=1)
-            .nonzero(as_tuple=True)[0]
-            .item()
-        )
-        answer_token_id = match_indices + len(answer_prompts[0])
-        return answer_token_id
+        # Find indices where the token equals the answer_token_id
+        match_indices = (tokens == answer_token_id).nonzero(as_tuple=True)[0]
+        if len(match_indices) > 0:
+            # Return the first occurrence
+            return match_indices[0].item()
+        else:
+            # Fallback (should not happen if data is formatted correctly)
+            return len(tokens) - 1
     except Exception:
         breakpoint()
 
@@ -88,6 +92,7 @@ def preprocess(
     tokenizer: transformers.PreTrainedTokenizer,
     bot_id: int,
     eot_id: int,
+    ans_id: int,  # Added ans_id
     remove_eos: bool,
 ) -> Dict:
     print("Tokenizing inputs... This may take some time...")
@@ -118,6 +123,7 @@ def preprocess(
         cot_id = [x[1:] for x in cot_id]
         answers_id = [x[1:] for x in answers_id]
 
+    # Reference Input (Teacher): Question + CoT + <ans> + Answer
     ref_input_ids = [
         torch.cat([x, y, z]).to(torch.long)
         for x, y, z in zip(sources_id, cot_id, answers_id)
@@ -128,44 +134,28 @@ def preprocess(
         z[: len(y)] = -100
         ref_labels.append(z)
 
-    # add eot to source
+    # Student Encoder Input: Question + <bot>
     sources_id = [
         torch.tensor(x.numpy().tolist() + [bot_id], dtype=torch.long)
         for x in sources_id
     ]
-    # add eot and eos
-    if remove_eos:
-        answers_id = [
-            torch.tensor([eot_id] + x.numpy().tolist(), dtype=torch.long)
-            for x in answers_id
-        ]
-    else:
-        answers_id = [
-            torch.tensor(
-                [eot_id, tokenizer.eos_token_id] + x.numpy().tolist(),
-                dtype=torch.long,
-            )
-            for x in answers_id
-        ]
 
-    answer_prompts = [
-        torch.tensor(tokenizer.encode("The answer is:")),
-        torch.tensor(tokenizer.encode("The next step result is:")),
-    ]
-    if answer_prompts[0][0] == tokenizer.bos_token_id:  # remove the bos
-        answer_prompts[0] = answer_prompts[0][1:]
-        answer_prompts[1] = answer_prompts[1][1:]
-
+    # Student Decoder Input (Labels): <ans> + Answer
+    # Note: answers string already starts with <ans> due to SupervisedDataset formatting,
+    # so answers_id[0] should be <ans> (or close to it depending on tokenizer).
+    
+    # We locate the specific <ans> token ID to be sure where alignment happens
     ref_answer_position = [
-        get_answer_token_position(x, answer_prompts, tokenizer)
+        get_answer_token_position(x, ans_id, tokenizer)
         for i, x in enumerate(ref_input_ids)
     ]
     model_answer_position = [
-        get_answer_token_position(x, answer_prompts, tokenizer) for x in answers_id
+        get_answer_token_position(x, ans_id, tokenizer) for x in answers_id
     ]
 
     ref_eos_position = [len(x) - 1 for x in ref_input_ids]
     model_eos_position = [len(x) - 1 for x in answers_id]
+    
     return dict(
         encoder_input_ids=sources_id,
         decoder_input_ids=answers_id,
@@ -192,6 +182,7 @@ class SupervisedDataset(Dataset):
         tokenizer,
         bot,
         eot,
+        ans,  # Added ans token ID
         training_args,
         data_args,
     ):
@@ -200,10 +191,8 @@ class SupervisedDataset(Dataset):
 
         self.data_name = data_name
         questions, cots, answers = [], [], []
-        num_ops_list = []
-        operators = ["+", "-", "*", "/"]
-
         token_nums = []
+
         for num_iter, example in enumerate(raw_data):
             if training_args.exp_mode and num_iter > training_args.exp_data_num:
                 break
@@ -212,15 +201,14 @@ class SupervisedDataset(Dataset):
                 and len(questions) >= data_args.max_samples
             ):
                 break
+            
             question = f"{example['question']}"
-            if (
-                "icot" in self.data_name and "full" in self.data_name
-            ):  # icot-full (GSM8k-Aug-NL)
-                # bad data
-                if example["answer"] is None:  # or example["response"] is None:
+            
+            # GSM8k-Aug-NL / icot-full
+            if "icot" in self.data_name and "full" in self.data_name:
+                if example["answer"] is None:
                     continue
 
-                # avoid OOM: remove very long data
                 token_num = len(
                     tokenizer.encode(
                         example["question"] + example["cot"] + example["answer"]
@@ -236,8 +224,11 @@ class SupervisedDataset(Dataset):
                 answer = example["answer"].split(" ")[-1]
                 if not answer[0].isdigit():
                     continue
-                answer = f"The answer is: {answer}"
+                
+                # CHANGED: Use <ans> token instead of natural language prompt
+                answer = f"{ANS_TOKEN} {answer}"
                 answer = answer.replace("####", "")
+                
                 questions.append(question)
 
                 if cot:
@@ -247,8 +238,9 @@ class SupervisedDataset(Dataset):
                 cots.append(cot)
                 answers.append(answer)
                 token_nums.append(token_num)
-            elif "icot" in self.data_name:  # icot (GSM8k-Aug)
-                # avoid OOM: remove very long data
+
+            # GSM8k-Aug / icot
+            elif "icot" in self.data_name:
                 token_num = len(
                     tokenizer.encode(
                         example["question"] + example["cot"] + example["answer"]
@@ -265,37 +257,31 @@ class SupervisedDataset(Dataset):
                 len_cot = len(cot)
                 for i in range(training_args.num_latent):
                     cot_list.append(" ".join(cot[: max(0, len_cot - i)]))
+                
                 answer = example["answer"].split(" ")[-1]
-
-                # some answers startwith the negative sign (-), bringing distillation problems for LLaMA
                 if not answer[0].isdigit():
                     continue
 
-                answer = f"The answer is: {answer}"
+                # CHANGED: Use <ans> token
+                answer = f"{ANS_TOKEN} {answer}"
                 answer = answer.replace("####", "")
+                
                 questions.append(question)
                 cots.append(" ".join(cot))
                 answers.append(answer)
                 token_nums.append(token_num)
-            elif "commonsense" in self.data_name or "strategy" in self.data_name:
+            
+            # Other datasets (commonsense, strategy, prontoqa)
+            elif "commonsense" in self.data_name or "strategy" in self.data_name or "prontoqa" in self.data_name:
+                if "prontoqa" in self.data_name:
+                    cot = "\n".join(example["steps"][:-1]) + "\n"
+                else:
+                    cot = example["cot"].strip() + "\n"
+                
                 question = example["question"].strip() + "\n"
-                cot = example["cot"].strip() + "\n"
-                answer = f"The answer is: {str(example['answer']).strip()}"
+                # CHANGED: Use <ans> token
+                answer = f"{ANS_TOKEN} {str(example['answer']).strip()}"
 
-                # avoid OOM: remove very long data
-                token_num = len(tokenizer.encode(question + " " + cot + " " + answer))
-                if token_num > training_args.max_token_num:
-                    continue
-                questions.append(question)
-                cots.append(cot)
-                answers.append(answer)
-                token_nums.append(token_num)
-            elif "prontoqa" in self.data_name:
-                question = example["question"].strip() + "\n"
-                cot = "\n".join(example["steps"][:-1]) + "\n"
-                answer = f"The answer is: {str(example['answer']).strip()}"
-
-                # avoid OOM: remove very long data
                 token_num = len(tokenizer.encode(question + " " + cot + " " + answer))
                 if token_num > training_args.max_token_num:
                     continue
@@ -305,6 +291,7 @@ class SupervisedDataset(Dataset):
                 token_nums.append(token_num)
             else:
                 raise NotImplementedError
+
         if training_args.exp_mode:
             questions = questions[: training_args.exp_data_num]
             cots = cots[: training_args.exp_data_num]
@@ -315,7 +302,7 @@ class SupervisedDataset(Dataset):
         logging.warning("Tokenizing inputs... This may take some time...")
 
         self.data_dict = preprocess(
-            questions, cots, answers, tokenizer, bot, eot, training_args.remove_eos
+            questions, cots, answers, tokenizer, bot, eot, ans, training_args.remove_eos
         )
         self.keys = list(self.data_dict.keys())
 
@@ -406,30 +393,25 @@ def concatenate_datasets(datasets: list) -> SupervisedDataset:
     if len(datasets) == 1:
         return datasets[0]
 
-    # Get all keys from the first dataset
     keys = datasets[0].keys
 
-    # Verify all datasets have the same keys
     for dataset in datasets[1:]:
         if dataset.keys != keys:
             raise ValueError(
                 f"Datasets have different keys. First: {keys}, Current: {dataset.keys}"
             )
 
-    # Concatenate all data dictionaries
     concatenated_data_dict = {}
     for key in keys:
         concatenated_data_dict[key] = []
         for dataset in datasets:
             concatenated_data_dict[key].extend(dataset.data_dict[key])
 
-    # Create a new dataset instance with concatenated data
     concatenated_dataset = SupervisedDataset.__new__(SupervisedDataset)
     concatenated_dataset.data_dict = concatenated_data_dict
     concatenated_dataset.keys = keys
     concatenated_dataset.data_name = "+".join([ds.data_name for ds in datasets])
 
-    # Calculate total length
     total_length = sum(len(dataset) for dataset in datasets)
     print(f"Concatenated {len(datasets)} datasets: {total_length} samples in total")
 
@@ -447,12 +429,14 @@ def load_single_dataset(
             dataset = load_dataset("zen-E/GSM8k-Aug-NL")["train"]
         else:
             dataset = load_dataset("zen-E/GSM8k-Aug")["train"]
+        
         train_dataset = SupervisedDataset(
             data_name=data_name,
             raw_data=dataset,
             tokenizer=tokenizer,
             bot=model.bot_id,
             eot=model.eot_id,
+            ans=model.ans_id,  # Pass the ANS token ID
             training_args=training_args,
             data_args=data_args,
         )
@@ -465,6 +449,7 @@ def load_single_dataset(
             tokenizer=tokenizer,
             bot=model.bot_id,
             eot=model.eot_id,
+            ans=model.ans_id,
             training_args=training_args,
             data_args=data_args,
         )
@@ -477,6 +462,7 @@ def load_single_dataset(
             tokenizer=tokenizer,
             bot=model.bot_id,
             eot=model.eot_id,
+            ans=model.ans_id,
             training_args=training_args,
             data_args=data_args,
         )
@@ -490,6 +476,7 @@ def load_single_dataset(
             tokenizer=tokenizer,
             bot=model.bot_id,
             eot=model.eot_id,
+            ans=model.ans_id,
             training_args=training_args,
             data_args=data_args,
         )
@@ -502,7 +489,6 @@ def make_supervised_data_module(tokenizer, data_args, model, training_args) -> D
     """Make dataset and collator for supervised fine-tuning."""
     logging.warning("Downloading Data")
 
-    # Load datasets from the list
     if not data_args.data_names:
         raise ValueError("data_names must be a non-empty list of dataset names")
 
@@ -513,7 +499,6 @@ def make_supervised_data_module(tokenizer, data_args, model, training_args) -> D
         )
         datasets.append(dataset)
 
-    # Concatenate all datasets
     train_dataset = concatenate_datasets(datasets)
 
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)

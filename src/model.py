@@ -237,16 +237,6 @@ class CODI(torch.nn.Module):
         Returns:
             CODI model with loaded weights
         """
-        # Step 1: Handle base model (model_name_or_path)
-        # Base model uses standard HuggingFace caching - no custom handling needed
-        # It will be downloaded to ~/.cache/huggingface/ automatically if it's a HF ID
-        print(f"Base model: {model_name_or_path}")
-        if not os.path.exists(model_name_or_path):
-            print(
-                "  → Will be downloaded from HuggingFace (cached in ~/.cache/huggingface/)"
-            )
-        else:
-            print("  → Loading from local path")
 
         # Create model arguments
         model_args = ModelArguments(
@@ -328,20 +318,30 @@ class CODI(torch.nn.Module):
                     "./checkpoints", checkpoint_name_clean
                 )
 
-            print(f"  → Downloading to: {checkpoint_save_path}")
+            # Check if checkpoint already exists locally
+            model_file_exists = os.path.exists(
+                os.path.join(checkpoint_save_path, "model.safetensors")
+            ) or os.path.exists(os.path.join(checkpoint_save_path, "pytorch_model.bin"))
 
-            from huggingface_hub import snapshot_download
+            if model_file_exists:
+                print(f"  → Checkpoint already exists at: {checkpoint_save_path}")
+                print("  → Skipping download")
+                checkpoint_path = checkpoint_save_path
+            else:
+                print(f"  → Downloading to: {checkpoint_save_path}")
 
-            # Download the entire checkpoint directory to the specified path
-            local_checkpoint_path = snapshot_download(
-                repo_id=checkpoint_path,
-                token=token,
-                allow_patterns=["*.safetensors", "*.bin", "*.json"],
-                local_dir=checkpoint_save_path,
-                local_dir_use_symlinks=False,  # Download actual files, not symlinks
-            )
-            print(f"  → Checkpoint saved to: {local_checkpoint_path}")
-            checkpoint_path = local_checkpoint_path
+                from huggingface_hub import snapshot_download
+
+                # Download the entire checkpoint directory to the specified path
+                local_checkpoint_path = snapshot_download(
+                    repo_id=checkpoint_path,
+                    token=token,
+                    allow_patterns=["*.safetensors", "*.bin", "*.json"],
+                    local_dir=checkpoint_save_path,
+                    local_dir_use_symlinks=False,  # Download actual files, not symlinks
+                )
+                print(f"  → Checkpoint saved to: {local_checkpoint_path}")
+                checkpoint_path = local_checkpoint_path
         else:
             print(f"Checkpoint: {checkpoint_path} (local path)")
 
@@ -388,13 +388,11 @@ class CODI(torch.nn.Module):
             self.codi = model_wrapper_class.from_pretrained(
                 self.model_name,
                 torch_dtype=target_dtype,
-                resume_download=True,
             )
         else:
             self.codi = model_wrapper_class.from_pretrained(
                 self.model_name,
                 torch_dtype=target_dtype,
-                resume_download=True,
                 quantization_config=transformers.BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_compute_dtype=torch.bfloat16,
@@ -741,6 +739,8 @@ class CODI(torch.nn.Module):
         greedy: bool = False,
         return_latent_vectors: bool = True,
         remove_eos: bool = False,
+        output_attentions: bool = False,
+        skip_thinking: bool = False,
     ):
         """
         Generate text with latent reasoning steps.
@@ -757,12 +757,15 @@ class CODI(torch.nn.Module):
             greedy: Whether to use greedy decoding
             return_latent_vectors: Whether to return latent reasoning vectors
             remove_eos: Whether to remove EOS token when adding BOT/EOT tokens
-
+            output_attentions: Whether to return attention weights for each generation step
+            latent_embeddings: Optional latent embeddings to use for generation
         Returns:
             dict with keys:
                 - 'sequences': Generated token IDs of shape (batch_size, generated_length)
                 - 'latent_vectors': List of latent reasoning vectors if return_latent_vectors=True
                   Each element is a tensor of shape (batch_size, 1, hidden_dim)
+                - 'attentions': List of attention tensors for each generation step if output_attentions=True
+                  Each element is a tuple of tensors, one per layer
         """
         if tokenizer is None:
             tokenizer = self.tokenizer
@@ -774,65 +777,99 @@ class CODI(torch.nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
-        # Add BOT token to input
-        if remove_eos:
-            bot_tensor = torch.tensor(
-                [self.bot_id], dtype=torch.long, device=device
-            ).expand(batch_size, 1)
-        else:
-            bot_tensor = torch.tensor(
-                [tokenizer.eos_token_id, self.bot_id], dtype=torch.long, device=device
-            ).expand(batch_size, 2)
+        # ==========================
+        # Split: first predict input, then <bot>, then latent vectors
+        # ==========================
 
-        input_ids = torch.cat((input_ids, bot_tensor), dim=1)
-        attention_mask = torch.cat(
-            (attention_mask, torch.ones_like(bot_tensor, device=device)), dim=1
-        )
-        print(tokenizer.convert_ids_to_tokens(input_ids[0]))
-
-        latent_vectors = []
-
+        # First, forward through the input sequence only (excluding bot/eos/BOT)
+        past_key_values = None
         with torch.no_grad():
-            # Encode the input
-            past_key_values = None
-            outputs = self.codi(
-                input_ids=input_ids,
+            orig_input_len = input_ids.shape[1]  # (batch, seq_len)
+
+            # Step 1: Without <bot> or eos, just the original input+attention
+            input_ids_base = input_ids
+            attention_mask_base = attention_mask
+
+            # Step 2: Predict up to just before <bot>
+            base_outputs = self.codi(
+                input_ids=input_ids_base,
                 use_cache=True,
                 output_hidden_states=True,
-                past_key_values=past_key_values,
-                attention_mask=attention_mask,
+                past_key_values=None,
+                attention_mask=attention_mask_base,
             )
-            past_key_values = outputs.past_key_values
-            latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+            past_key_values = base_outputs.past_key_values
+            if not skip_thinking:
+                # Step 3: Now add <bot> (with or without extra eos)
+                if remove_eos:
+                    bot_tensor = torch.tensor(
+                        [self.bot_id], dtype=torch.long, device=device
+                    ).expand(batch_size, 1)
+                else:
+                    bot_tensor = torch.tensor(
+                        [tokenizer.eos_token_id, self.bot_id],
+                        dtype=torch.long,
+                        device=device,
+                    ).expand(batch_size, 2)
 
-            if return_latent_vectors:
-                latent_vectors.append(latent_embd.clone())
+                input_ids_bot = torch.cat((input_ids, bot_tensor), dim=1)
+                attention_mask_bot = torch.cat(
+                    (attention_mask, torch.ones_like(bot_tensor, device=device)), dim=1
+                )
+                print(tokenizer.convert_ids_to_tokens(input_ids_bot[0]))
 
-            if self.use_prj:
-                latent_embd = self.prj(latent_embd)
-                latent_embd = latent_embd.to(
-                    dtype=self.codi.dtype
-                )  # FIX: layer norm casts to fp32
+                # Forward only the new tokens (<eos>, <bot>) using past_key_values
+                # Only pass new tokens ([batch, 1 or 2]) to speed things up
+                new_tokens_len = bot_tensor.shape[1]
+                input_ids_new_tokens = input_ids_bot[:, -new_tokens_len:]
+                attention_mask_new_tokens = attention_mask_bot[:, -new_tokens_len:]
 
-            # Latent reasoning iterations
-            for i in range(num_latent_iterations):
                 outputs = self.codi(
-                    inputs_embeds=latent_embd,
+                    input_ids=input_ids_new_tokens,
                     use_cache=True,
                     output_hidden_states=True,
                     past_key_values=past_key_values,
+                    attention_mask=attention_mask_bot,
                 )
-                past_key_values = outputs.past_key_values
+                past_key_values = (
+                    outputs.past_key_values
+                )  # updated for use in latent steps
+
+                # Hidden state after <bot>
                 latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+
+                latent_vectors = []
+                attentions_list = [] if output_attentions else None
 
                 if return_latent_vectors:
                     latent_vectors.append(latent_embd.clone())
 
+                # Optionally project latent_embd if using prj
                 if self.use_prj:
                     latent_embd = self.prj(latent_embd)
                     latent_embd = latent_embd.to(
                         dtype=self.codi.dtype
                     )  # FIX: layer norm casts to fp32
+
+                # Latent reasoning iterations
+                for i in range(num_latent_iterations):
+                    outputs = self.codi(
+                        inputs_embeds=latent_embd,
+                        use_cache=True,
+                        output_hidden_states=True,
+                        past_key_values=past_key_values,
+                    )
+                    past_key_values = outputs.past_key_values
+                    latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+
+                    if return_latent_vectors:
+                        latent_vectors.append(latent_embd.clone())
+
+                    if self.use_prj:
+                        latent_embd = self.prj(latent_embd)
+                        latent_embd = latent_embd.to(
+                            dtype=self.codi.dtype
+                        )  # FIX: layer norm casts to fp32
 
             # Add EOT token embeddings
             if remove_eos:
@@ -869,10 +906,18 @@ class CODI(torch.nn.Module):
                     output_hidden_states=False,
                     attention_mask=None,
                     use_cache=True,
-                    output_attentions=False,
+                    output_attentions=output_attentions,
                     past_key_values=past_key_values,
                 )
                 past_key_values = out.past_key_values
+
+                # Collect attentions if requested
+                if (
+                    output_attentions
+                    and hasattr(out, "attentions")
+                    and out.attentions is not None
+                ):
+                    attentions_list.append(out.attentions)
                 logits = out.logits[:, -1, : self.codi.config.vocab_size - 1]
 
                 # Sampling
@@ -947,7 +992,10 @@ class CODI(torch.nn.Module):
 
         result = {"sequences": sequences}
 
-        if return_latent_vectors:
+        if return_latent_vectors and not skip_thinking:
             result["latent_vectors"] = latent_vectors
+
+        if output_attentions:
+            result["attentions"] = attentions_list
 
         return result

@@ -122,11 +122,11 @@ def preprocess(
         for x in sources_id
     ]
     sources_id_lcot = [
-        torch.tensor(x.numpy().tolist() + [tokenizer.lcot_id], dtype=torch.long)
+        torch.tensor(x.numpy().tolist() + [tokenizer.bot_id], dtype=torch.long)
         for x in sources_id
     ]
     sources_id_vcot = [
-        torch.tensor(x.numpy().tolist() + [tokenizer.vcot_id], dtype=torch.long)
+        torch.tensor(x.numpy().tolist() + [tokenizer.bot_id], dtype=torch.long)
         for x in sources_id
     ]
 

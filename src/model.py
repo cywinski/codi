@@ -557,7 +557,161 @@ class CODI(torch.nn.Module):
         ans_ce_loss = self.loss_fct(effective_ans_logits, ans_targets)
         ans_ce_loss *= self.sft_loss_factor
 
-        # Encode the question
+        # Print avg probability of the correct response (perplexity) if enabled
+        if getattr(self.training_args, "print_loss", False):
+            # Exclude IGNORE index tokens when computing probabilities
+            target_mask = ans_targets != -100
+            logits_masked = effective_ans_logits[target_mask]
+            targets_masked = ans_targets[target_mask]
+            if logits_masked.numel() > 0:
+                probs = torch.softmax(logits_masked, dim=-1)
+                correct_token_probs = probs.gather(
+                    1, targets_masked.unsqueeze(1)
+                ).squeeze(1)
+                avg_prob = correct_token_probs.mean().item()
+                perplexity = torch.exp(-torch.log(correct_token_probs).mean()).item()
+                print(
+                    f"[DirectAns] Avg Probability: {avg_prob:.4f} | Perplexity: {perplexity:.2f} | Loss: {ans_ce_loss.item():.4f}"
+                )
+                # Print one example of predicted (greedy) tokens and GT tokens
+                # Find a non-empty target sequence
+                batch_size = encoder_input_ids_ans.shape[0]
+                seq_len = encoder_input_ids_ans.shape[1] + decoder_input_ids.shape[1]
+                try:
+                    # Reshape for batch-wise examination
+                    ans_logits_reshaped = ans_logits.view(
+                        batch_size, -1, ans_logits.size(-1)
+                    )
+                    ans_targets_reshaped = direct_ans_targets.long().view(
+                        batch_size, -1
+                    )
+                    tokenizer = getattr(self, "tokenizer", None)
+                    vocab_size = ans_logits.size(-1)
+
+                    for ex_idx in range(batch_size):
+                        # Find example where target not all -100
+                        ex_targets = ans_targets_reshaped[ex_idx]
+                        non_ignore = ex_targets != -100
+                        if non_ignore.any():
+                            ex_logits = ans_logits_reshaped[ex_idx][non_ignore]
+                            pred_tokens = ex_logits.argmax(dim=-1)
+                            gt_tokens = ex_targets[non_ignore]
+                            # Print all tokens (not just first n)
+                            pred_tokens_all = pred_tokens
+                            gt_tokens_all = gt_tokens
+                            if tokenizer is not None:
+                                # To display input tokens without padding,
+                                # filter encoder_input_ids_ans and decoder_input_ids to exclude padding token id
+                                pad_token_id = tokenizer.pad_token_id
+
+                                in_enc = encoder_input_ids_ans[ex_idx].tolist()
+                                in_dec = decoder_input_ids[ex_idx].tolist()
+                                # Remove all padding tokens from both encoder and decoder inputs
+                                in_enc_no_pad = [
+                                    tid
+                                    for tid in in_enc
+                                    if pad_token_id is None or tid != pad_token_id
+                                ]
+                                in_dec_no_pad = [
+                                    tid
+                                    for tid in in_dec
+                                    if pad_token_id is None or tid != pad_token_id
+                                ]
+                                input_tokens = tokenizer.convert_ids_to_tokens(
+                                    in_enc_no_pad + in_dec_no_pad
+                                )
+
+                                pred_token_ids_no_pad = [
+                                    t.item()
+                                    for t in pred_tokens_all
+                                    if pad_token_id is None or t.item() != pad_token_id
+                                ]
+                                gt_token_ids_no_pad = [
+                                    t.item()
+                                    for t in gt_tokens_all
+                                    if pad_token_id is None or t.item() != pad_token_id
+                                ]
+                                pred_str_all = tokenizer.convert_ids_to_tokens(
+                                    pred_token_ids_no_pad
+                                )
+                                gt_str_all = tokenizer.convert_ids_to_tokens(
+                                    gt_token_ids_no_pad
+                                )
+
+                                print(
+                                    f"[DirectAns] Example [Input tokens]: {input_tokens}"
+                                )
+                                print(
+                                    f"[DirectAns] Example [greedy/pred]:  {pred_str_all}"
+                                )
+                                print(
+                                    f"[DirectAns] Example [GT]:           {gt_str_all}"
+                                )
+                            else:
+                                in_enc = encoder_input_ids_ans[ex_idx].tolist()
+                                in_dec = decoder_input_ids[ex_idx].tolist()
+                                input_tokens = in_enc + in_dec
+                                pad_token_id = None
+                                if (
+                                    hasattr(self, "tokenizer")
+                                    and getattr(self, "tokenizer", None) is not None
+                                ):
+                                    pad_token_id = self.tokenizer.pad_token_id
+                                if pad_token_id is not None:
+                                    input_tokens = [
+                                        tid
+                                        for tid in input_tokens
+                                        if tid != pad_token_id
+                                    ]
+                                    pred_token_ids_no_pad = [
+                                        t.item()
+                                        for t in pred_tokens_all
+                                        if t.item() != pad_token_id
+                                    ]
+                                    gt_token_ids_no_pad = [
+                                        t.item()
+                                        for t in gt_tokens_all
+                                        if t.item() != pad_token_id
+                                    ]
+                                else:
+                                    pred_token_ids_no_pad = [
+                                        t.item() for t in pred_tokens_all
+                                    ]
+                                    gt_token_ids_no_pad = [
+                                        t.item() for t in gt_tokens_all
+                                    ]
+                                print(
+                                    f"[DirectAns] Example [Input token IDs]: {input_tokens}"
+                                )
+                                print(
+                                    f"[DirectAns] Example [greedy/pred token IDs]: {pred_token_ids_no_pad}"
+                                )
+                                print(
+                                    f"[DirectAns] Example [GT token IDs]:           {gt_token_ids_no_pad}"
+                                )
+                            break  # Only print one example
+                            gt_tokens = gt_tokens[:n_disp]
+                            if tokenizer is not None:
+                                pred_str = tokenizer.convert_ids_to_tokens(
+                                    pred_tokens.tolist()
+                                )
+                                gt_str = tokenizer.convert_ids_to_tokens(
+                                    gt_tokens.tolist()
+                                )
+                                print(f"[DirectAns] Example [greedy/pred]: {pred_str}")
+                                print(f"[DirectAns] Example [GT]:       {gt_str}")
+                            else:
+                                print(
+                                    f"[DirectAns] Example [greedy/pred token IDs]: {pred_tokens.tolist()}"
+                                )
+                                print(
+                                    f"[DirectAns] Example [GT token IDs]:       {gt_tokens.tolist()}"
+                                )
+                            break  # Only print one example
+                except Exception as e:
+                    print(f"Failed to print token examples: {e}")
+
+        # Encode the question for the student
         past_key_values = None
         outputs = self.codi(
             input_ids=encoder_input_ids_lcot,
@@ -831,44 +985,41 @@ class CODI(torch.nn.Module):
             past_key_values = base_outputs.past_key_values
 
             # Store hidden states from prompt processing (until thinking)
-            if output_hidden_states and hasattr(base_outputs, "hidden_states"):
-                prompt_hidden_states = base_outputs.hidden_states
+            prompt_hidden_states = base_outputs.hidden_states
+            # Step 3: Now add <bot> (with or without extra eos)
+            if remove_eos:
+                bot_tensor = torch.tensor(
+                    [sot_token], dtype=torch.long, device=device
+                ).expand(batch_size, 1)
+            else:
+                bot_tensor = torch.tensor(
+                    [tokenizer.eos_token_id, sot_token],
+                    dtype=torch.long,
+                    device=device,
+                ).expand(batch_size, 2)
+
+            input_ids_bot = torch.cat((input_ids, bot_tensor), dim=1)
+            attention_mask_bot = torch.cat(
+                (attention_mask, torch.ones_like(bot_tensor, device=device)), dim=1
+            )
+            print(tokenizer.convert_ids_to_tokens(input_ids_bot[0]))
+
+            # Forward only the new tokens (<eos>, <bot>) using past_key_values
+            # Only pass new tokens ([batch, 1 or 2]) to speed things up
+            new_tokens_len = bot_tensor.shape[1]
+            input_ids_new_tokens = input_ids_bot[:, -new_tokens_len:]
+            attention_mask_new_tokens = attention_mask_bot[:, -new_tokens_len:]
+
+            outputs = self.codi(
+                input_ids=input_ids_new_tokens,
+                use_cache=True,
+                output_hidden_states=True,
+                past_key_values=past_key_values,
+                attention_mask=attention_mask_bot,
+            )
+            past_key_values = outputs.past_key_values  # updated for use in latent steps
+
             if not skip_thinking:
-                # Step 3: Now add <bot> (with or without extra eos)
-                if remove_eos:
-                    bot_tensor = torch.tensor(
-                        [sot_token], dtype=torch.long, device=device
-                    ).expand(batch_size, 1)
-                else:
-                    bot_tensor = torch.tensor(
-                        [tokenizer.eos_token_id, sot_token],
-                        dtype=torch.long,
-                        device=device,
-                    ).expand(batch_size, 2)
-
-                input_ids_bot = torch.cat((input_ids, bot_tensor), dim=1)
-                attention_mask_bot = torch.cat(
-                    (attention_mask, torch.ones_like(bot_tensor, device=device)), dim=1
-                )
-                print(tokenizer.convert_ids_to_tokens(input_ids_bot[0]))
-
-                # Forward only the new tokens (<eos>, <bot>) using past_key_values
-                # Only pass new tokens ([batch, 1 or 2]) to speed things up
-                new_tokens_len = bot_tensor.shape[1]
-                input_ids_new_tokens = input_ids_bot[:, -new_tokens_len:]
-                attention_mask_new_tokens = attention_mask_bot[:, -new_tokens_len:]
-
-                outputs = self.codi(
-                    input_ids=input_ids_new_tokens,
-                    use_cache=True,
-                    output_hidden_states=True,
-                    past_key_values=past_key_values,
-                    attention_mask=attention_mask_bot,
-                )
-                past_key_values = (
-                    outputs.past_key_values
-                )  # updated for use in latent steps
-
                 # Hidden state after <bot>
                 latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
 
@@ -908,7 +1059,7 @@ class CODI(torch.nn.Module):
 
             # Add EOT token embeddings
             if remove_eos:
-                print("Generating EOT token embeddings")
+                print("Adding EOT token")
                 eot_emb = (
                     self.get_embd(self.codi, self.model_name)(
                         torch.tensor(

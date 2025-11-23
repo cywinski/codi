@@ -163,15 +163,43 @@ def preprocess(
     #     answer_prompts[0] = answer_prompts[0][1:]
     #     answer_prompts[1] = answer_prompts[1][1:]
 
-    ref_answer_position = [len(y) for y in sources_id_vcot]
+    answer_prompts = [
+        torch.tensor(tokenizer.encode("Answer: ", add_special_tokens=False))
+    ]
+    # ref_answer_position = [len(y) for y in sources_id_vcot]
+    ref_answer_position = [
+        get_answer_token_position(x, answer_prompts, tokenizer) for x in ref_input_ids
+    ]
+    model_answer_position = [
+        get_answer_token_position(x, answer_prompts, tokenizer) for x in answers_id
+    ]
+    # model_answer_position = [0] * len(answers_id)
 
-    model_answer_position = [0] * len(answers_id)
+    encoder_input_ids_ans = [
+        torch.cat([src, ans], dim=0) for src, ans in zip(sources_id_ans, answers_id)
+    ]
+    encoder_input_ids_labels = [
+        torch.cat(
+            [
+                torch.full(
+                    (src.size(0) + 1,), -100, dtype=torch.long
+                ),  # -100 for source +1
+                ans[1:]
+                if ans.size(0) > 1
+                else torch.empty(
+                    0, dtype=torch.long
+                ),  # actual label tokens for answer (skip first token, typically eot/eos)
+            ],
+            dim=0,
+        )
+        for src, ans in zip(sources_id_ans, answers_id)
+    ]
 
     ref_eos_position = [len(x) - 1 for x in ref_input_ids]
     model_eos_position = [len(x) - 1 for x in answers_id]
     return dict(
         # encoder_input_ids=sources_id,
-        encoder_input_ids_ans=sources_id_ans,
+        encoder_input_ids_ans=encoder_input_ids_ans,
         encoder_input_ids_lcot=sources_id_lcot,
         # encoder_input_ids_vcot=sources_id_vcot,
         decoder_input_ids=answers_id,
@@ -182,6 +210,7 @@ def preprocess(
         ref_eos_position=ref_eos_position,
         model_eos_position=model_eos_position,
         ref_labels=ref_labels,
+        encoder_input_ids_labels=encoder_input_ids_labels,
     )
 
 
@@ -240,7 +269,7 @@ class SupervisedDataset(Dataset):
                 answer = example["answer"].split(" ")[-1]
                 if not answer[0].isdigit():
                     continue
-                answer = f"{answer}"
+                answer = f"Answer: {answer}"
                 answer = answer.replace("####", "")
                 questions.append(question)
 
@@ -351,6 +380,7 @@ class DataCollatorForSupervisedDataset(object):
             ref_answer_position,
             model_answer_position,
             ref_labels,
+            encoder_input_ids_labels,
         ) = tuple(
             [instance[key] for instance in instances]
             for key in (
@@ -363,27 +393,31 @@ class DataCollatorForSupervisedDataset(object):
                 "ref_answer_position",
                 "model_answer_position",
                 "ref_labels",
+                "encoder_input_ids_labels",
             )
         )
 
-        # pad left
+        # pad left for encoder_input_ids_lcot
         reversed_input_ids_lcot = [seq.flip(0) for seq in encoder_input_ids_lcot]
-        reversed_input_ids_ans = [seq.flip(0) for seq in encoder_input_ids_ans]
-        # encoder_input_ids_vcot = torch.nn.utils.rnn.pad_sequence(
-        #     reversed_input_ids,
-        #     batch_first=True,
-        #     padding_value=self.tokenizer.pad_token_id,
-        # ).flip(1)
         encoder_input_ids_lcot = torch.nn.utils.rnn.pad_sequence(
             reversed_input_ids_lcot,
             batch_first=True,
             padding_value=self.tokenizer.pad_token_id,
         ).flip(1)
+
+        # pad right for encoder_input_ids_ans (standard torch pad_sequence)
         encoder_input_ids_ans = torch.nn.utils.rnn.pad_sequence(
-            reversed_input_ids_ans,
+            encoder_input_ids_ans,
             batch_first=True,
             padding_value=self.tokenizer.pad_token_id,
-        ).flip(1)
+        )
+
+        # pad right for encoder_input_ids_labels
+        encoder_input_ids_labels = torch.nn.utils.rnn.pad_sequence(
+            encoder_input_ids_labels,
+            batch_first=True,
+            padding_value=IGNORE_INDEX,
+        )
 
         # pad
         ref_input_ids = torch.nn.utils.rnn.pad_sequence(
@@ -418,6 +452,7 @@ class DataCollatorForSupervisedDataset(object):
             model_answer_position=torch.tensor(model_answer_position, dtype=torch.long),
             ref_attention_mask=ref_input_ids.ne(self.tokenizer.pad_token_id),
             ref_labels=ref_labels,
+            encoder_input_ids_labels=encoder_input_ids_labels,
         )
 
 

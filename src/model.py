@@ -143,6 +143,9 @@ class TrainingArguments(transformers.TrainingArguments):
     sft_loss_factor: float = field(
         default=1.0, metadata={"help": "A multiplier of the SFT loss."}
     )
+    ce_loss_factor: float = field(
+        default=1.0, metadata={"help": "A multiplier of the CE loss."}
+    )
     inf_latent_iterations: int = field(default=1, metadata={"help": ""})
     inf_num_iterations: int = field(
         default=5, metadata={"help": "Run multiple times during inference"}
@@ -447,7 +450,7 @@ class CODI(torch.nn.Module):
         self.print_loss = training_args.print_loss
         self.ref_loss_factor = training_args.ref_loss_factor
         self.sft_loss_factor = training_args.sft_loss_factor
-
+        self.ce_loss_factor = training_args.ce_loss_factor
         # Cross Entropy Loss
         self.loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
 
@@ -528,188 +531,21 @@ class CODI(torch.nn.Module):
         ref_labels: torch.LongTensor = None,
         step: int = None,
         step_ratio: float = None,
+        encoder_input_ids_labels: Optional[torch.LongTensor] = None,
     ):
         if not self.fix_attn_mask:
             ref_attention_mask = None
 
-        # --- Standard pipeline as before ---
-        # first direct answer sft ce loss
-        direct_ans_input = torch.cat([encoder_input_ids_ans, decoder_input_ids], dim=1)
-        direct_ans_targets = torch.cat(
-            [
-                torch.ones(
-                    encoder_input_ids_ans.shape[0], encoder_input_ids_ans.shape[1] + 1
-                ).to(encoder_input_ids_ans.device)
-                * -100,
-                labels[:, 1:],
-            ],
-            dim=1,
-        )
+        direct_ans_attention_mask = (
+            encoder_input_ids_ans != self.tokenizer.pad_token_id
+        ).to(encoder_input_ids_ans.dtype)
         ans_outputs = self.codi(
-            input_ids=direct_ans_input,
-            use_cache=True,
-            output_hidden_states=True,
+            input_ids=encoder_input_ids_ans,
+            attention_mask=direct_ans_attention_mask,
+            labels=encoder_input_ids_labels.long(),
         )
-        ans_logits = ans_outputs.logits
-        # effective_ans_logits = ans_logits[:, :-1, :]
-        effective_ans_logits = ans_logits.reshape(-1, ans_logits.size(-1))
-        ans_targets = direct_ans_targets.reshape(-1).long()
-        ans_ce_loss = self.loss_fct(effective_ans_logits, ans_targets)
+        ans_ce_loss = ans_outputs.loss
         ans_ce_loss *= self.sft_loss_factor
-
-        # Print avg probability of the correct response (perplexity) if enabled
-        if getattr(self.training_args, "print_loss", False):
-            # Exclude IGNORE index tokens when computing probabilities
-            target_mask = ans_targets != -100
-            logits_masked = effective_ans_logits[target_mask]
-            targets_masked = ans_targets[target_mask]
-            if logits_masked.numel() > 0:
-                probs = torch.softmax(logits_masked, dim=-1)
-                correct_token_probs = probs.gather(
-                    1, targets_masked.unsqueeze(1)
-                ).squeeze(1)
-                avg_prob = correct_token_probs.mean().item()
-                perplexity = torch.exp(-torch.log(correct_token_probs).mean()).item()
-                print(
-                    f"[DirectAns] Avg Probability: {avg_prob:.4f} | Perplexity: {perplexity:.2f} | Loss: {ans_ce_loss.item():.4f}"
-                )
-                # Print one example of predicted (greedy) tokens and GT tokens
-                # Find a non-empty target sequence
-                batch_size = encoder_input_ids_ans.shape[0]
-                seq_len = encoder_input_ids_ans.shape[1] + decoder_input_ids.shape[1]
-                try:
-                    # Reshape for batch-wise examination
-                    ans_logits_reshaped = ans_logits.view(
-                        batch_size, -1, ans_logits.size(-1)
-                    )
-                    ans_targets_reshaped = direct_ans_targets.long().view(
-                        batch_size, -1
-                    )
-                    tokenizer = getattr(self, "tokenizer", None)
-                    vocab_size = ans_logits.size(-1)
-
-                    for ex_idx in range(batch_size):
-                        # Find example where target not all -100
-                        ex_targets = ans_targets_reshaped[ex_idx]
-                        non_ignore = ex_targets != -100
-                        if non_ignore.any():
-                            ex_logits = ans_logits_reshaped[ex_idx][non_ignore]
-                            pred_tokens = ex_logits.argmax(dim=-1)
-                            gt_tokens = ex_targets[non_ignore]
-                            # Print all tokens (not just first n)
-                            pred_tokens_all = pred_tokens
-                            gt_tokens_all = gt_tokens
-                            if tokenizer is not None:
-                                # To display input tokens without padding,
-                                # filter encoder_input_ids_ans and decoder_input_ids to exclude padding token id
-                                pad_token_id = tokenizer.pad_token_id
-
-                                in_enc = encoder_input_ids_ans[ex_idx].tolist()
-                                in_dec = decoder_input_ids[ex_idx].tolist()
-                                # Remove all padding tokens from both encoder and decoder inputs
-                                in_enc_no_pad = [
-                                    tid
-                                    for tid in in_enc
-                                    if pad_token_id is None or tid != pad_token_id
-                                ]
-                                in_dec_no_pad = [
-                                    tid
-                                    for tid in in_dec
-                                    if pad_token_id is None or tid != pad_token_id
-                                ]
-                                input_tokens = tokenizer.convert_ids_to_tokens(
-                                    in_enc_no_pad + in_dec_no_pad
-                                )
-
-                                pred_token_ids_no_pad = [
-                                    t.item()
-                                    for t in pred_tokens_all
-                                    if pad_token_id is None or t.item() != pad_token_id
-                                ]
-                                gt_token_ids_no_pad = [
-                                    t.item()
-                                    for t in gt_tokens_all
-                                    if pad_token_id is None or t.item() != pad_token_id
-                                ]
-                                pred_str_all = tokenizer.convert_ids_to_tokens(
-                                    pred_token_ids_no_pad
-                                )
-                                gt_str_all = tokenizer.convert_ids_to_tokens(
-                                    gt_token_ids_no_pad
-                                )
-
-                                print(
-                                    f"[DirectAns] Example [Input tokens]: {input_tokens}"
-                                )
-                                print(
-                                    f"[DirectAns] Example [greedy/pred]:  {pred_str_all}"
-                                )
-                                print(
-                                    f"[DirectAns] Example [GT]:           {gt_str_all}"
-                                )
-                            else:
-                                in_enc = encoder_input_ids_ans[ex_idx].tolist()
-                                in_dec = decoder_input_ids[ex_idx].tolist()
-                                input_tokens = in_enc + in_dec
-                                pad_token_id = None
-                                if (
-                                    hasattr(self, "tokenizer")
-                                    and getattr(self, "tokenizer", None) is not None
-                                ):
-                                    pad_token_id = self.tokenizer.pad_token_id
-                                if pad_token_id is not None:
-                                    input_tokens = [
-                                        tid
-                                        for tid in input_tokens
-                                        if tid != pad_token_id
-                                    ]
-                                    pred_token_ids_no_pad = [
-                                        t.item()
-                                        for t in pred_tokens_all
-                                        if t.item() != pad_token_id
-                                    ]
-                                    gt_token_ids_no_pad = [
-                                        t.item()
-                                        for t in gt_tokens_all
-                                        if t.item() != pad_token_id
-                                    ]
-                                else:
-                                    pred_token_ids_no_pad = [
-                                        t.item() for t in pred_tokens_all
-                                    ]
-                                    gt_token_ids_no_pad = [
-                                        t.item() for t in gt_tokens_all
-                                    ]
-                                print(
-                                    f"[DirectAns] Example [Input token IDs]: {input_tokens}"
-                                )
-                                print(
-                                    f"[DirectAns] Example [greedy/pred token IDs]: {pred_token_ids_no_pad}"
-                                )
-                                print(
-                                    f"[DirectAns] Example [GT token IDs]:           {gt_token_ids_no_pad}"
-                                )
-                            break  # Only print one example
-                            gt_tokens = gt_tokens[:n_disp]
-                            if tokenizer is not None:
-                                pred_str = tokenizer.convert_ids_to_tokens(
-                                    pred_tokens.tolist()
-                                )
-                                gt_str = tokenizer.convert_ids_to_tokens(
-                                    gt_tokens.tolist()
-                                )
-                                print(f"[DirectAns] Example [greedy/pred]: {pred_str}")
-                                print(f"[DirectAns] Example [GT]:       {gt_str}")
-                            else:
-                                print(
-                                    f"[DirectAns] Example [greedy/pred token IDs]: {pred_tokens.tolist()}"
-                                )
-                                print(
-                                    f"[DirectAns] Example [GT token IDs]:       {gt_tokens.tolist()}"
-                                )
-                            break  # Only print one example
-                except Exception as e:
-                    print(f"Failed to print token examples: {e}")
 
         # Encode the question for the student
         past_key_values = None
@@ -877,22 +713,19 @@ class CODI(torch.nn.Module):
         distill_loss *= self.distill_loss_factor
         distill_loss_total *= self.distill_loss_factor
 
+        ce_loss_total *= self.ce_loss_factor
         if self.print_loss:
             print(
                 f"loss={ce_loss + distill_loss}, ce_loss={ce_loss}, distill_loss={distill_loss}, ce_loss_total={ce_loss_total}, distill_loss_total={distill_loss_total}, ref_ce_loss={ref_ce_loss}, sft_loss={ans_ce_loss}"
             )
-
         # Add the new ans ce loss to the overall loss
         loss = ce_loss_total + distill_loss_total + ref_ce_loss + ans_ce_loss
 
-        if ce_loss_total != 0:
-            ce_loss_total = ce_loss_total.detach().item()
-        if distill_loss_total != 0:
-            distill_loss_total = distill_loss_total.detach().item()
-        if ref_ce_loss != 0:
-            ref_ce_loss = ref_ce_loss.detach().item()
-        if ans_ce_loss != 0:
-            ans_ce_loss = ans_ce_loss.detach().item()
+        # if ce_loss_total != 0:
+        ce_loss_total = ce_loss_total.detach().item()
+        distill_loss_total = distill_loss_total.detach().item()
+        ref_ce_loss = ref_ce_loss.detach().item()
+        ans_ce_loss = ans_ce_loss.detach().item()
 
         return {
             "loss": loss,
@@ -960,135 +793,150 @@ class CODI(torch.nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
-        # ==========================
-        # Split: first predict input, then <bot>, then latent vectors
-        # ==========================
-
-        # First, forward through the input sequence only (excluding bot/eos/BOT)
         past_key_values = None
         prompt_hidden_states = None
+
+        if remove_eos:
+            bot_tensor = torch.tensor(
+                [sot_token], dtype=torch.long, device=device
+            ).expand(batch_size, 1)
+        else:
+            bot_tensor = torch.tensor(
+                [tokenizer.eos_token_id, sot_token],
+                dtype=torch.long,
+                device=device,
+            ).expand(batch_size, 2)
+
+        input_ids_bot = torch.cat((input_ids, bot_tensor), dim=1)
+        attention_mask_bot = torch.cat(
+            (attention_mask, torch.ones_like(bot_tensor, device=device)), dim=1
+        )
+
+        if skip_thinking:
+            # just use generate from transformers
+            eot_tensor = torch.tensor(
+                [tokenizer.encode("<|eocot|>", add_special_tokens=False)[0]],
+                dtype=torch.long,
+                device=device,
+            ).expand(batch_size, 1)
+            input_ids_bot = torch.cat((input_ids, bot_tensor, eot_tensor), dim=1)
+            attention_mask_bot = torch.cat(
+                (
+                    attention_mask,
+                    torch.ones_like(bot_tensor, device=device),
+                    torch.ones_like(eot_tensor, device=device),
+                ),
+                dim=1,
+            )
+            print(tokenizer.convert_ids_to_tokens(input_ids_bot[0]))
+            outputs = self.codi.generate(
+                input_ids=input_ids_bot,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                attention_mask=attention_mask_bot,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+            # Calculate the number of prompt tokens for each item in the batch
+            prompt_lengths = [
+                input_ids_bot[i].size(0) for i in range(input_ids_bot.size(0))
+            ]
+            # Remove the prompt tokens from each generated output
+            sequences = []
+            for i, prompt_len in enumerate(prompt_lengths):
+                sequences.append(outputs[i, prompt_len:])
+            # Pad to the maximum generation length in batch if needed
+            max_gen_len = max(seq.size(0) for seq in sequences)
+            padded_sequences = torch.full(
+                (len(sequences), max_gen_len),
+                tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
+                dtype=outputs.dtype,
+                device=outputs.device,
+            )
+            for i, seq in enumerate(sequences):
+                padded_sequences[i, : seq.size(0)] = seq
+            return {"sequences": padded_sequences}
+
         with torch.no_grad():
-            orig_input_len = input_ids.shape[1]  # (batch, seq_len)
-
-            # Step 1: Without <bot> or eos, just the original input+attention
-            input_ids_base = input_ids
-            attention_mask_base = attention_mask
-
-            # Step 2: Predict up to just before <bot>
-            base_outputs = self.codi(
-                input_ids=input_ids_base,
+            print(tokenizer.convert_ids_to_tokens(input_ids_bot[0]))
+            outputs = self.codi(
+                input_ids=input_ids_bot,
                 use_cache=True,
                 output_hidden_states=output_hidden_states,
                 past_key_values=None,
-                attention_mask=attention_mask_base,
-            )
-            past_key_values = base_outputs.past_key_values
-
-            # Store hidden states from prompt processing (until thinking)
-            prompt_hidden_states = base_outputs.hidden_states
-            # Step 3: Now add <bot> (with or without extra eos)
-            if remove_eos:
-                bot_tensor = torch.tensor(
-                    [sot_token], dtype=torch.long, device=device
-                ).expand(batch_size, 1)
-            else:
-                bot_tensor = torch.tensor(
-                    [tokenizer.eos_token_id, sot_token],
-                    dtype=torch.long,
-                    device=device,
-                ).expand(batch_size, 2)
-
-            input_ids_bot = torch.cat((input_ids, bot_tensor), dim=1)
-            attention_mask_bot = torch.cat(
-                (attention_mask, torch.ones_like(bot_tensor, device=device)), dim=1
-            )
-            print(tokenizer.convert_ids_to_tokens(input_ids_bot[0]))
-
-            # Forward only the new tokens (<eos>, <bot>) using past_key_values
-            # Only pass new tokens ([batch, 1 or 2]) to speed things up
-            new_tokens_len = bot_tensor.shape[1]
-            input_ids_new_tokens = input_ids_bot[:, -new_tokens_len:]
-            attention_mask_new_tokens = attention_mask_bot[:, -new_tokens_len:]
-
-            outputs = self.codi(
-                input_ids=input_ids_new_tokens,
-                use_cache=True,
-                output_hidden_states=True,
-                past_key_values=past_key_values,
                 attention_mask=attention_mask_bot,
             )
-            past_key_values = outputs.past_key_values  # updated for use in latent steps
+            past_key_values = outputs.past_key_values
+            prompt_hidden_states = outputs.hidden_states
+            # Hidden state after <bot>
+            latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
 
-            if not skip_thinking:
-                # Hidden state after <bot>
+            latent_vectors = []
+            attentions_list = [] if output_attentions else None
+
+            if return_latent_vectors:
+                latent_vectors.append(latent_embd.clone())
+
+            # Optionally project latent_embd if using prj
+            if self.use_prj:
+                latent_embd = self.prj(latent_embd)
+                latent_embd = latent_embd.to(
+                    dtype=self.codi.dtype
+                )  # FIX: layer norm casts to fp32
+
+            # Latent reasoning iterations
+            for i in range(num_latent_iterations):
+                print(f"Latent reasoning iteration {i + 1}")
+                outputs = self.codi(
+                    inputs_embeds=latent_embd,
+                    use_cache=True,
+                    output_hidden_states=True,
+                    past_key_values=past_key_values,
+                )
+                past_key_values = outputs.past_key_values
                 latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
-
-                latent_vectors = []
-                attentions_list = [] if output_attentions else None
 
                 if return_latent_vectors:
                     latent_vectors.append(latent_embd.clone())
 
-                # Optionally project latent_embd if using prj
                 if self.use_prj:
                     latent_embd = self.prj(latent_embd)
                     latent_embd = latent_embd.to(
                         dtype=self.codi.dtype
                     )  # FIX: layer norm casts to fp32
 
-                # Latent reasoning iterations
-                for i in range(num_latent_iterations):
-                    print(f"Latent reasoning iteration {i + 1}")
-                    outputs = self.codi(
-                        inputs_embeds=latent_embd,
-                        use_cache=True,
-                        output_hidden_states=True,
-                        past_key_values=past_key_values,
-                    )
-                    past_key_values = outputs.past_key_values
-                    latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
-
-                    if return_latent_vectors:
-                        latent_vectors.append(latent_embd.clone())
-
-                    if self.use_prj:
-                        latent_embd = self.prj(latent_embd)
-                        latent_embd = latent_embd.to(
-                            dtype=self.codi.dtype
-                        )  # FIX: layer norm casts to fp32
-
-            # Add EOT token embeddings
-            if remove_eos:
-                print("Adding EOT token")
-                eot_emb = (
-                    self.get_embd(self.codi, self.model_name)(
-                        torch.tensor(
-                            [tokenizer.convert_tokens_to_ids("<|eocot|>")],
-                            dtype=torch.long,
-                            device=device,
+                # Add EOT token embeddings
+                if remove_eos:
+                    eot_emb = (
+                        self.get_embd(self.codi, self.model_name)(
+                            torch.tensor(
+                                [tokenizer.convert_tokens_to_ids("<|eocot|>")],
+                                dtype=torch.long,
+                                device=device,
+                            )
                         )
+                        .unsqueeze(0)
+                        .to(device)
                     )
-                    .unsqueeze(0)
-                    .to(device)
-                )
-            else:
-                eot_emb = (
-                    self.get_embd(self.codi, self.model_name)(
-                        torch.tensor(
-                            [
-                                tokenizer.convert_tokens_to_ids("<|eocot|>"),
-                                tokenizer.eos_token_id,
-                            ],
-                            dtype=torch.long,
-                            device=device,
+                else:
+                    eot_emb = (
+                        self.get_embd(self.codi, self.model_name)(
+                            torch.tensor(
+                                [
+                                    tokenizer.convert_tokens_to_ids("<|eocot|>"),
+                                    tokenizer.eos_token_id,
+                                ],
+                                dtype=torch.long,
+                                device=device,
+                            )
                         )
+                        .unsqueeze(0)
+                        .to(device)
                     )
-                    .unsqueeze(0)
-                    .to(device)
-                )
 
-            eot_emb = eot_emb.expand(batch_size, -1, -1)
-            output_emb = eot_emb
+                eot_emb = eot_emb.expand(batch_size, -1, -1)
+                output_emb = eot_emb
 
             # Generate tokens
             finished = torch.zeros(batch_size, dtype=torch.bool, device=device)

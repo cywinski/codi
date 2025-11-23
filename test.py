@@ -13,6 +13,7 @@
 #    limitations under the License.
 
 import argparse
+import csv
 import json
 import logging
 import math
@@ -42,7 +43,14 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
 
 
-def evaluation(model_args, data_args, training_args):
+def evaluation(
+    model_args,
+    data_args,
+    training_args,
+    iteration=None,
+    output_prefix=None,
+    skip_thinking=False,
+):
     # Load model using from_pretrained
     model = CODI.from_pretrained(
         checkpoint_path=model_args.ckpt_dir,
@@ -60,25 +68,25 @@ def evaluation(model_args, data_args, training_args):
         strict=False,
     )
 
-    # Load tokenizer
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model.model_name,
-        token=model_args.token,
-        model_max_length=training_args.model_max_length,
-        padding_side="left",
-        use_fast=False,
-    )
+    # # Load tokenizer
+    # tokenizer = transformers.AutoTokenizer.from_pretrained(
+    #     model.model_name,
+    #     token=model_args.token,
+    #     model_max_length=training_args.model_max_length,
+    #     padding_side="left",
+    #     use_fast=False,
+    # )
 
-    if tokenizer.pad_token_id is None:
-        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-        tokenizer.pad_token_id = model.pad_token_id
-        if tokenizer.pad_token_id is None:  # error handling
-            tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("[PAD]")
+    # if tokenizer.pad_token_id is None:
+    #     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    #     tokenizer.pad_token_id = model.pad_token_id
+    #     if tokenizer.pad_token_id is None:  # error handling
+    #         tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("[PAD]")
 
-    # Add special tokens if not already present
-    tokenizer.add_special_tokens({"additional_special_tokens": ["<|bot|>", "<|eot|>"]})
-    tokenizer.bot_id = tokenizer.convert_tokens_to_ids("<|bot|>")
-    tokenizer.eot_id = tokenizer.convert_tokens_to_ids("<|eot|>")
+    # # Add special tokens if not already present
+    # tokenizer.add_special_tokens({"additional_special_tokens": ["<|bot|>", "<|eot|>"]})
+    # tokenizer.bot_id = tokenizer.convert_tokens_to_ids("<|bot|>")
+    # tokenizer.eot_id = tokenizer.convert_tokens_to_ids("<|eot|>")
 
     device = "cuda"
 
@@ -119,9 +127,17 @@ def evaluation(model_args, data_args, training_args):
         raise NotImplementedError
 
     logging.warning("Formatting inputs...")
-    question = [
-        f"{example[question_name].strip().replace('  ', ' ')}" for example in test_set
-    ]
+    print(f"skip_thinking: {skip_thinking}")
+    if not skip_thinking:
+        question = [
+            f"{example[question_name].strip().replace('  ', ' ')}"
+            for example in test_set
+        ]
+    else:
+        question = [
+            f"{example[question_name].strip().replace('  ', ' ')}"
+            for example in test_set
+        ]
     answer = []
 
     # get numerical answer
@@ -160,7 +176,14 @@ def evaluation(model_args, data_args, training_args):
 
     ans_pred_list = []
     len_cot = []
+    results_data = []  # Store all results for CSV export
     model.eval()
+    if model.tokenizer.pad_token_id is None:
+        model.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        model.tokenizer.pad_token_id = model.tokenizer.convert_tokens_to_ids("[PAD]")
+
+    tokenizer = model.tokenizer
+    print(f"{len(tokenizer)=}")
 
     for step in range(eval_step):
         # Prepare batch
@@ -176,8 +199,10 @@ def evaluation(model_args, data_args, training_args):
             batch_questions,
             return_tensors="pt",
             padding="longest",
+            padding_side="left",
         )
         input_ids = batch["input_ids"].to(device)
+        print(tokenizer.convert_ids_to_tokens(input_ids[0]))
         attention_mask = batch["attention_mask"].to(device)
 
         # Generate using the abstract generate method
@@ -187,6 +212,7 @@ def evaluation(model_args, data_args, training_args):
                 attention_mask=attention_mask,
                 tokenizer=tokenizer,
                 max_new_tokens=256,
+                output_hidden_states=True,
                 num_latent_iterations=training_args.inf_latent_iterations,
                 temperature=0.1,
                 top_k=40,
@@ -194,6 +220,10 @@ def evaluation(model_args, data_args, training_args):
                 greedy=training_args.greedy,
                 return_latent_vectors=False,
                 remove_eos=training_args.remove_eos,
+                skip_thinking=skip_thinking,
+                sot_token=tokenizer.convert_tokens_to_ids(
+                    "<|ans|>" if skip_thinking else "<|bocot|>"
+                ),
             )
 
         # Process generated sequences
@@ -216,18 +246,28 @@ def evaluation(model_args, data_args, training_args):
             len_cot.append(len(generated_tokens))
             decoded_pred = tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
+            question_idx = step * data_args.batch_size + mini_step
+            pred_answer = extract_answer_number(decoded_pred, data_args)
+
+            # Store data for CSV export
+            results_data.append(
+                {
+                    "question": question[question_idx],
+                    "prediction": pred_answer,
+                    "ground_truth": answer[question_idx],
+                    "decoded_prediction": decoded_pred,
+                }
+            )
+
             if do_print:
-                question_idx = step * data_args.batch_size + mini_step
                 print(f"Question {question_idx} Starts...")
                 print(f"Q: {question[question_idx]}")
                 print(decoded_pred)
                 print(f"Question {question_idx} Ends")
-                print(
-                    f"Prediction={extract_answer_number(decoded_pred, data_args)}; Groundtruth={answer[question_idx]}"
-                )
+                print(f"Prediction={pred_answer}; Groundtruth={answer[question_idx]}")
                 print("")
 
-            ans_pred_list.append(extract_answer_number(decoded_pred, data_args))
+            ans_pred_list.append(pred_answer)
 
     accuracy = compute_accuracy(answer, ans_pred_list)
 
@@ -235,6 +275,24 @@ def evaluation(model_args, data_args, training_args):
         f"adapter: {model_args.adapter_name_or_path} | GSM8K test accuracy: {100 * accuracy:.2f}% | "
     )
     print(f"average length of COT: {sum(len_cot) / len(len_cot)}")
+
+    # Save results to CSV
+    filename_parts = []
+    if output_prefix:
+        filename_parts.append(output_prefix)
+    filename_parts.append(data_name)
+    if iteration is not None:
+        filename_parts.append(f"iter_{iteration + 1}")
+
+    csv_filename = f"results_{'_'.join(filename_parts)}.csv"
+
+    with open(csv_filename, "w", newline="", encoding="utf-8") as csvfile:
+        fieldnames = ["question", "prediction", "ground_truth", "decoded_prediction"]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results_data)
+
+    print(f"Results saved to {csv_filename}")
 
     return 100 * accuracy
 
@@ -299,15 +357,30 @@ if __name__ == "__main__":
             # Remove it from sys.argv so HfArgumentParser doesn't see it
             sys.argv.pop(1)
 
-    # Also check for --config_file flag
+    # Also check for --config_file flag and --output_prefix
     arg_parser = argparse.ArgumentParser(description="Test CODI model", add_help=False)
     arg_parser.add_argument(
         "--config_file", type=str, default=None, help="Path to JSON or YAML config file"
+    )
+    arg_parser.add_argument(
+        "--output_prefix",
+        type=str,
+        default=None,
+        help="Prefix to add to CSV output filename",
+    )
+    arg_parser.add_argument(
+        "--skip_thinking",
+        action="store_true",
+        default=False,
+        help="Skip thinking step",
     )
     config_args, remaining_args = arg_parser.parse_known_args()
 
     # Use --config_file flag if provided, otherwise use positional argument we found
     config_path = config_args.config_file or config_path
+
+    # Extract output_prefix before processing config
+    output_prefix = config_args.output_prefix
 
     if config_path:
         # Remove --config_file and its value from sys.argv if present
@@ -316,6 +389,13 @@ if __name__ == "__main__":
             sys.argv.pop(idx)  # Remove --config_file
             if idx < len(sys.argv) and not sys.argv[idx].startswith("-"):
                 sys.argv.pop(idx)  # Remove config file path
+
+        # Remove --output_prefix and its value from sys.argv if present
+        if "--output_prefix" in sys.argv:
+            idx = sys.argv.index("--output_prefix")
+            sys.argv.pop(idx)  # Remove --output_prefix
+            if idx < len(sys.argv) and not sys.argv[idx].startswith("-"):
+                sys.argv.pop(idx)  # Remove output_prefix value
 
         # Load config file
         if config_path.endswith(".yaml") or config_path.endswith(".yml"):
@@ -342,7 +422,18 @@ if __name__ == "__main__":
         # TrainingArguments needs special handling
         training_config = config.get("training_args", {})
         training_args = TrainingArguments(**training_config)
+
+        # Get output_prefix from config if not provided via command line
+        if output_prefix is None:
+            output_prefix = config.get("output_prefix")
     else:
+        # Remove --output_prefix and its value from sys.argv if present (before HfArgumentParser)
+        if "--output_prefix" in sys.argv:
+            idx = sys.argv.index("--output_prefix")
+            sys.argv.pop(idx)  # Remove --output_prefix
+            if idx < len(sys.argv) and not sys.argv[idx].startswith("-"):
+                sys.argv.pop(idx)  # Remove output_prefix value
+
         # Use HfArgumentParser for command-line arguments
         parser = transformers.HfArgumentParser(
             (ModelArguments, DataArguments, TrainingArguments)
@@ -350,8 +441,17 @@ if __name__ == "__main__":
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     accu_list = []
+    print(f"skip_thinking: {config_args.skip_thinking}")
+    config_args.skip_thinking = True
     for i in range(training_args.inf_num_iterations):
-        accu = evaluation(model_args, data_args, training_args)
+        accu = evaluation(
+            model_args,
+            data_args,
+            training_args,
+            iteration=i,
+            output_prefix=output_prefix,
+            skip_thinking=config_args.skip_thinking,
+        )
         accu_list.append(accu)
     print(
         f"Average accuracy over {training_args.inf_num_iterations} sampling: {sum(accu_list) / len(accu_list)}"

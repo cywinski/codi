@@ -182,8 +182,7 @@ def train():
 
     # Add extra (non-core) special tokens using 'additional_special_tokens'
     additional_special_tokens = [
-        "<|verbalized_think|>",
-        "<|latent_think|>",
+        "<|bocot|>",
         "<|eocot|>",
     ]
     tokenizer.add_special_tokens(
@@ -191,12 +190,7 @@ def train():
     )
 
     # Optionally assign ids for later convenience
-    tokenizer.verbalized_think_id = tokenizer.convert_tokens_to_ids(
-        "<|verbalized_think|>"
-    )  # beginning of CoT
-    tokenizer.latent_think_id = tokenizer.convert_tokens_to_ids(
-        "<|latent_think|>"
-    )  # beginning of CoT
+    tokenizer.bot_id = tokenizer.convert_tokens_to_ids("<|bocot|>")  # beginning of CoT
     tokenizer.eot_id = tokenizer.convert_tokens_to_ids("<|eocot|>")  # end of CoT
     print(f"{len(tokenizer)=}")
 

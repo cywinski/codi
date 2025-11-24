@@ -132,13 +132,11 @@ def preprocess(
     # ]
 
     sources_id_latent = [
-        torch.tensor(x.numpy().tolist() + [tokenizer.latent_think_id], dtype=torch.long)
+        torch.tensor(x.numpy().tolist() + [tokenizer.bot_id], dtype=torch.long)
         for x in sources_id
     ]
     sources_id_verbalized = [
-        torch.tensor(
-            x.numpy().tolist() + [tokenizer.verbalized_think_id], dtype=torch.long
-        )
+        torch.tensor(x.numpy().tolist() + [tokenizer.bot_id], dtype=torch.long)
         for x in sources_id
     ]
     # add eot and eos

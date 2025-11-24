@@ -579,46 +579,23 @@ class CODI(torch.nn.Module):
         distill_loss_total = 0
         ce_loss_total = 0
 
-        with torch.no_grad():
-            ref_outputs = self.codi(
-                input_ids=ref_input_ids,
-                output_hidden_states=True,
-                attention_mask=ref_attention_mask,
-            )
+        # with torch.no_grad():
+        #     ref_outputs = self.codi(
+        #         input_ids=ref_input_ids,
+        #         output_hidden_states=True,
+        #         attention_mask=ref_attention_mask,
+        #     )
         ref_outputs_with_grad = self.codi(
             input_ids=ref_input_ids,
             output_hidden_states=True,
             attention_mask=ref_attention_mask,
+            labels=ref_labels.long(),
         )
-
-        ref_outputs_list = [ref_outputs]
-        ref_input_ids = [ref_input_ids]
-
-        if self.training_args.print_ref_model_stats:
-            for i, (ref_inputs, ref_outputs) in enumerate(
-                zip(ref_input_ids, ref_outputs_list)
-            ):
-                if len(ref_outputs_list) > 1:
-                    pos = ref_answer_position[i]
-                else:
-                    pos = ref_answer_position
-                ref_probs = torch.nn.functional.softmax(ref_outputs.logits, dim=-1)
-                input_positions = (
-                    (pos - 1)
-                    .unsqueeze(1)
-                    .unsqueeze(1)
-                    .expand(-1, -1, ref_probs.size(2))
-                )
-                ref_probs_at_positions = ref_probs.gather(1, input_positions)
-                probe_positions_positions = pos.unsqueeze(1)
-                probe_positions = ref_inputs.gather(
-                    1, probe_positions_positions
-                ).unsqueeze(1)
-                ref_probs_of_target = ref_probs_at_positions.gather(2, probe_positions)
-                print(
-                    f"stage{i}: mean of the prob of the target token: {ref_probs_of_target.mean()}"
-                )
-
+        ref_outputs_hidden_states = [
+            h.detach() for h in ref_outputs_with_grad.hidden_states
+        ]
+        ref_ce_loss = ref_outputs_with_grad.loss
+        ref_ce_loss *= self.ref_loss_factor
         num_latent = self.num_latent
         if self.num_latent != 0:
             for i in range(num_latent):
@@ -656,13 +633,11 @@ class CODI(torch.nn.Module):
                         past_key_values=past_key_values,
                         attention_mask=dynamic_mask,
                     )
-                    # Teacher task's output
-                    ref_outputs = ref_outputs_list[0]
 
                     distill_loss = 0
                     # Calculate distillation loss between the teacher's logits and the student's logits for every layer
                     for j, (out, ref_out) in enumerate(
-                        zip(outputs.hidden_states, ref_outputs.hidden_states)
+                        zip(outputs.hidden_states, ref_outputs_hidden_states)
                     ):
                         ref_selected = ref_out.gather(
                             1,
@@ -702,15 +677,6 @@ class CODI(torch.nn.Module):
                         target_ids = labels[:, 1:].reshape(-1)
                         ce_loss = self.loss_fct(effective_logits, target_ids)
                         ce_loss_total += ce_loss
-
-        # Calculate the CE loss for the teacher task
-        ref_ce_loss = 0
-        ref_logits = ref_outputs_with_grad.logits
-        effective_ref_logits = ref_logits[:, :-1, :]
-        effective_ref_logits = effective_ref_logits.reshape(-1, ref_logits.size(-1))
-        ref_target_ids = ref_labels[:, 1:].reshape(-1)
-        ref_ce_loss = self.loss_fct(effective_ref_logits, ref_target_ids)
-        ref_ce_loss *= self.ref_loss_factor
 
         # Weigh the distillation loss
         distill_loss *= self.distill_loss_factor
@@ -825,10 +791,11 @@ class CODI(torch.nn.Module):
         attention_mask_bot = torch.cat(
             (attention_mask, torch.ones_like(bot_tensor, device=device)), dim=1
         )
-        print(tokenizer.convert_ids_to_tokens(input_ids_bot[0]))
 
         if verbalize_cot or skip_thinking:
             # just use generate from transformers
+            print(tokenizer.convert_ids_to_tokens(input_ids_bot[0]))
+
             outputs = self.codi.generate(
                 input_ids=input_ids_bot,
                 max_new_tokens=max_new_tokens,

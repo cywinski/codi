@@ -87,6 +87,7 @@ def preprocess(
     answers: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
     remove_eos: bool,
+    answer_only: bool,
 ) -> Dict:
     print("Tokenizing inputs... This may take some time...")
     sources_id = _tokenize_fn(sources, tokenizer)["input_ids"]
@@ -101,12 +102,12 @@ def preprocess(
             )
             for x in sources_id
         ]
-        cot_id = [
-            torch.tensor(
-                x.numpy().tolist() + [tokenizer.eos_token_id], dtype=torch.long
-            )
-            for x in cot_id
-        ]
+        # cot_id = [
+        #     torch.tensor(
+        #         x.numpy().tolist() + [tokenizer.eos_token_id], dtype=torch.long
+        #     )
+        #     for x in cot_id
+        # ]
     answers_id = [
         torch.tensor(x.numpy().tolist() + [tokenizer.eos_token_id], dtype=torch.long)
         for x in answers_id
@@ -116,40 +117,48 @@ def preprocess(
         cot_id = [x[1:] for x in cot_id]
         answers_id = [x[1:] for x in answers_id]
 
-    ref_input_ids = [
-        torch.cat([x, y, z]).to(torch.long)
-        for x, y, z in zip(sources_id, cot_id, answers_id)
-    ]
-    ref_labels = []
-    for x, y in zip(ref_input_ids, sources_id):
-        z = x.clone()
-        z[: len(y)] = -100
-        ref_labels.append(z)
-
     # add eot to source
-    sources_id_ans = [
-        torch.tensor(x.numpy().tolist() + [tokenizer.ans_id], dtype=torch.long)
-        for x in sources_id
-    ]
-    sources_id_lcot = [
+    # sources_id_ans = [
+    #     torch.tensor(x.numpy().tolist() + [tokenizer.ans_id], dtype=torch.long)
+    #     for x in sources_id
+    # ]
+    # sources_id_lcot = [
+    #     torch.tensor(x.numpy().tolist() + [tokenizer.lcot_id], dtype=torch.long)
+    #     for x in sources_id
+    # ]
+    # sources_id_vcot = [
+    #     torch.tensor(x.numpy().tolist() + [tokenizer.vcot_id], dtype=torch.long)
+    #     for x in sources_id
+    # ]
+
+    sources_id_cot = [
         torch.tensor(x.numpy().tolist() + [tokenizer.bot_id], dtype=torch.long)
         for x in sources_id
     ]
-
     # add eot and eos
-    if remove_eos:
-        answers_id = [
-            torch.tensor([tokenizer.eot_id] + x.numpy().tolist(), dtype=torch.long)
-            for x in answers_id
-        ]
-    else:
-        answers_id = [
-            torch.tensor(
-                [tokenizer.eot_id, tokenizer.eos_token_id] + x.numpy().tolist(),
-                dtype=torch.long,
-            )
-            for x in answers_id
-        ]
+    # if remove_eos:
+    answers_id = [
+        torch.tensor([tokenizer.eot_id] + x.numpy().tolist(), dtype=torch.long)
+        for x in answers_id
+    ]
+    # else:
+    #     answers_id = [
+    #         torch.tensor(
+    #             [tokenizer.eot_id, tokenizer.eos_token_id] + x.numpy().tolist(),
+    #             dtype=torch.long,
+    #         )
+    #         for x in answers_id
+    #     ]
+
+    ref_input_ids = [
+        torch.cat([x, y, z]).to(torch.long)
+        for x, y, z in zip(sources_id_cot, cot_id, answers_id)
+    ]
+    ref_labels = []
+    for x, y in zip(ref_input_ids, sources_id_cot):
+        z = x.clone()
+        z[: len(y)] = -100
+        ref_labels.append(z)
 
     # answer_prompts = [
     #     torch.tensor(tokenizer.encode("")),
@@ -159,22 +168,25 @@ def preprocess(
     #     answer_prompts[0] = answer_prompts[0][1:]
     #     answer_prompts[1] = answer_prompts[1][1:]
 
-    answer_prompts = [
-        torch.tensor(tokenizer.encode("The answer is:", add_special_tokens=False))
-    ]
-    ref_answer_position = [
-        get_answer_token_position(x, answer_prompts, tokenizer) for x in ref_input_ids
-    ]
-    model_answer_position = [
-        get_answer_token_position(x, answer_prompts, tokenizer) for x in answers_id
-    ]
-
-    ### answer only
-    # ref_answer_position = [len(y) - len(a) for y, a in zip(ref_input_ids, answers_id)]
-    # model_answer_position = [0] * len(answers_id)
+    if not answer_only:
+        answer_prompts = [
+            torch.tensor(tokenizer.encode("The answer is:", add_special_tokens=False))
+        ]
+        ref_answer_position = [
+            get_answer_token_position(x, answer_prompts, tokenizer)
+            for x in ref_input_ids
+        ]
+        model_answer_position = [
+            get_answer_token_position(x, answer_prompts, tokenizer) for x in answers_id
+        ]
+    else:
+        ref_answer_position = [
+            len(y) - len(a) for y, a in zip(ref_input_ids, answers_id)
+        ]
+        model_answer_position = [0] * len(answers_id)
 
     encoder_input_ids_ans = [
-        torch.cat([src, ans], dim=0) for src, ans in zip(sources_id_ans, answers_id)
+        torch.cat([src, ans], dim=0) for src, ans in zip(sources_id, answers_id)
     ]
     encoder_input_ids_labels = [
         torch.cat(
@@ -190,7 +202,7 @@ def preprocess(
             ],
             dim=0,
         )
-        for src, ans in zip(sources_id_ans, answers_id)
+        for src, ans in zip(sources_id, answers_id)
     ]
 
     ref_eos_position = [len(x) - 1 for x in ref_input_ids]
@@ -198,7 +210,7 @@ def preprocess(
     return dict(
         # encoder_input_ids=sources_id,
         encoder_input_ids_ans=encoder_input_ids_ans,
-        encoder_input_ids_lcot=sources_id_lcot,
+        encoder_input_ids_lcot=sources_id_cot,
         # encoder_input_ids_vcot=sources_id_vcot,
         decoder_input_ids=answers_id,
         ref_input_ids=ref_input_ids,
@@ -244,6 +256,8 @@ class SupervisedDataset(Dataset):
             ):
                 break
             question = f"{example['question']}"
+            if training_args.answer_only:
+                question = question + " Output only the answer and nothing else."
             if (
                 "icot" in self.data_name and "full" in self.data_name
             ):  # icot-full (GSM8k-Aug-NL)
@@ -267,7 +281,10 @@ class SupervisedDataset(Dataset):
                 answer = example["answer"].split(" ")[-1]
                 if not answer[0].isdigit():
                     continue
-                answer = f"The answer is: {answer}"
+                if training_args.answer_only:
+                    answer = f"{answer}"
+                else:
+                    answer = f"The answer is: {answer}"
                 answer = answer.replace("####", "")
                 questions.append(question)
 
@@ -301,8 +318,10 @@ class SupervisedDataset(Dataset):
                 # some answers startwith the negative sign (-), bringing distillation problems for LLaMA
                 if not answer[0].isdigit():
                     continue
-
-                answer = f"{answer}"
+                if training_args.answer_only:
+                    answer = f"{answer}"
+                else:
+                    answer = f"The answer is: {answer}"
                 answer = answer.replace("####", "")
                 questions.append(question)
                 cots.append(" ".join(cot))
@@ -311,7 +330,10 @@ class SupervisedDataset(Dataset):
             elif "commonsense" in self.data_name or "strategy" in self.data_name:
                 question = example["question"].strip() + "\n"
                 cot = example["cot"].strip() + "\n"
-                answer = f"{str(example['answer']).strip()}"
+                if training_args.answer_only:
+                    answer = f"{str(example['answer']).strip()}"
+                else:
+                    answer = f"The answer is: {str(example['answer']).strip()}"
 
                 # avoid OOM: remove very long data
                 token_num = len(tokenizer.encode(question + " " + cot + " " + answer))
@@ -324,7 +346,10 @@ class SupervisedDataset(Dataset):
             elif "prontoqa" in self.data_name:
                 question = example["question"].strip() + "\n"
                 cot = "\n".join(example["steps"][:-1]) + "\n"
-                answer = f"{str(example['answer']).strip()}"
+                if training_args.answer_only:
+                    answer = f"{str(example['answer']).strip()}"
+                else:
+                    answer = f"The answer is: {str(example['answer']).strip()}"
 
                 # avoid OOM: remove very long data
                 token_num = len(tokenizer.encode(question + " " + cot + " " + answer))
@@ -346,7 +371,12 @@ class SupervisedDataset(Dataset):
         logging.warning("Tokenizing inputs... This may take some time...")
 
         self.data_dict = preprocess(
-            questions, cots, answers, tokenizer, training_args.remove_eos
+            questions,
+            cots,
+            answers,
+            tokenizer,
+            training_args.remove_eos,
+            training_args.answer_only,
         )
         self.keys = list(self.data_dict.keys())
 

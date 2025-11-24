@@ -182,7 +182,7 @@ def train():
 
     # Add extra (non-core) special tokens using 'additional_special_tokens'
     # NOTE: I'm not entirely sure if we should differentiate between the latent and verbalized CoT tokens.
-    additional_special_tokens = ["<|bocot|>", "<|eocot|>", "<|ans|>"]
+    additional_special_tokens = ["<|bocot|>", "<|eocot|>"]
     tokenizer.add_special_tokens(
         {"additional_special_tokens": additional_special_tokens}
     )
@@ -190,7 +190,6 @@ def train():
     # Optionally assign ids for later convenience
     tokenizer.bot_id = tokenizer.convert_tokens_to_ids("<|bocot|>")  # beginning of CoT
     tokenizer.eot_id = tokenizer.convert_tokens_to_ids("<|eocot|>")  # end of CoT
-    tokenizer.ans_id = tokenizer.convert_tokens_to_ids("<|ans|>")  # answer
     print(f"{len(tokenizer)=}")
 
     model = CODI(model_args, training_args, lora_config, tokenizer)

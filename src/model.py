@@ -168,6 +168,9 @@ class TrainingArguments(transformers.TrainingArguments):
     max_token_num: int = field(
         default=1000, metadata={"help": "Limit the longest data to avoid OOM."}
     )
+    answer_only: bool = field(
+        default=False, metadata={"help": "Only use the answer token for training."}
+    )
 
 
 def print_trainable_parameters(model):
@@ -753,6 +756,7 @@ class CODI(torch.nn.Module):
         output_hidden_states: bool = False,
         skip_thinking: bool = False,
         sot_token: int = None,
+        verbalize_cot: bool = False,
     ):
         """
         Generate text with latent reasoning steps.
@@ -795,6 +799,36 @@ class CODI(torch.nn.Module):
 
         past_key_values = None
         prompt_hidden_states = None
+
+        if verbalize_cot:
+            # just use generate from transformers
+            print(tokenizer.convert_ids_to_tokens(input_ids[0]))
+            outputs = self.codi.generate(
+                input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                attention_mask=attention_mask,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+            # Calculate the number of prompt tokens for each item in the batch
+            prompt_lengths = [input_ids[i].size(0) for i in range(input_ids.size(0))]
+            # Remove the prompt tokens from each generated output
+            sequences = []
+            for i, prompt_len in enumerate(prompt_lengths):
+                sequences.append(outputs[i, prompt_len:])
+            # Pad to the maximum generation length in batch if needed
+            max_gen_len = max(seq.size(0) for seq in sequences)
+            padded_sequences = torch.full(
+                (len(sequences), max_gen_len),
+                tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
+                dtype=outputs.dtype,
+                device=outputs.device,
+            )
+            for i, seq in enumerate(sequences):
+                padded_sequences[i, : seq.size(0)] = seq
+            return {"sequences": padded_sequences}
 
         if remove_eos:
             bot_tensor = torch.tensor(

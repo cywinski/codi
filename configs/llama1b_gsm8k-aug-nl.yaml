@@ -11,14 +11,14 @@ model_args:
 data_args:
   data_names:
     - "icot_full"
-    # - "strategy"
     # - "commonsense"
-  max_samples: null
+    # - "strategy"
+  max_samples: 1000
 
 # Wandb Arguments
 wandb:
   project: "codi"
-  run_name: "codi_llama1b_gsm8k-the-answer-is"
+  run_name: "codi_llama1b_gsm8k_commonsense-test"
 
 # Hub Arguments
 hub:
@@ -28,9 +28,9 @@ hub:
 
 # Training Arguments
 training_args:
-  output_dir: "./models/codi_llama1b_gsm8k-the-answer-is"
-  expt_name: "codi_llama1b_gsm8k-the-answer-is"
-  logging_dir: "./models/codi_llama1b_gsm8k-the-answer-is/logs"
+  output_dir: "./models/codi_llama1b_gsm8k_commonsense-the-answer-is"
+  expt_name: "codi_llama1b_gsm8k_commonsense-the-answer-is"
+  logging_dir: "./models/codi_llama1b_gsm8k_commonsense-the-answer-is/logs"
   logging_steps: 10
   seed: 11
   model_max_length: 512
@@ -57,7 +57,7 @@ training_args:
   distill_loss_div_std: true
   exp_mode: false
   exp_data_num: 200
-  remove_eos: true
+  remove_eos: false
   distill_loss_factor: 20
   ref_loss_factor: 1.0
   print_ref_model_stats: false
@@ -68,3 +68,4 @@ training_args:
   sft_loss_factor: 1.0
   include_last_cot: false
   ce_loss_factor: 1.0
+  answer_only: true

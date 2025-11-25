@@ -825,13 +825,14 @@ class CODI(torch.nn.Module):
                 padded_sequences[i, : seq.size(0)] = seq
             return {"sequences": padded_sequences}
 
+        past_key_values = None
         with torch.no_grad():
             print(tokenizer.convert_ids_to_tokens(input_ids_bot[0]))
             outputs = self.codi(
                 input_ids=input_ids_bot,
                 use_cache=True,
                 output_hidden_states=output_hidden_states,
-                past_key_values=None,
+                past_key_values=past_key_values,
                 attention_mask=attention_mask_bot,
             )
             past_key_values = outputs.past_key_values
@@ -887,7 +888,7 @@ class CODI(torch.nn.Module):
                 .to(device)
             )
             eot_emb = eot_emb.expand(batch_size, -1, -1)
-            output_emb = eot_emb
+            output = eot_emb
 
             # Generate tokens
             finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
@@ -895,7 +896,7 @@ class CODI(torch.nn.Module):
 
             for step in range(max_new_tokens):
                 out = self.codi(
-                    inputs_embeds=output_emb,
+                    inputs_embeds=output,
                     output_hidden_states=False,
                     attention_mask=None,
                     use_cache=True,
@@ -903,6 +904,7 @@ class CODI(torch.nn.Module):
                     past_key_values=past_key_values,
                 )
                 past_key_values = out.past_key_values
+                logits = out.logits[:, -1, : self.codi.config.vocab_size - 1]
 
                 # Collect attentions if requested
                 if (
@@ -911,7 +913,6 @@ class CODI(torch.nn.Module):
                     and out.attentions is not None
                 ):
                     attentions_list.append(out.attentions)
-                logits = out.logits[:, -1, : self.codi.config.vocab_size - 1]
 
                 # Sampling
                 if greedy:
@@ -965,7 +966,7 @@ class CODI(torch.nn.Module):
                     break
 
                 # Get embeddings for next iteration
-                output_emb = (
+                output = (
                     self.get_embd(self.codi, self.model_name)(next_token_ids)
                     .unsqueeze(1)
                     .to(device)

@@ -117,20 +117,6 @@ def preprocess(
         cot_id = [x[1:] for x in cot_id]
         answers_id = [x[1:] for x in answers_id]
 
-    # add eot to source
-    # sources_id_ans = [
-    #     torch.tensor(x.numpy().tolist() + [tokenizer.ans_id], dtype=torch.long)
-    #     for x in sources_id
-    # ]
-    # sources_id_lcot = [
-    #     torch.tensor(x.numpy().tolist() + [tokenizer.lcot_id], dtype=torch.long)
-    #     for x in sources_id
-    # ]
-    # sources_id_vcot = [
-    #     torch.tensor(x.numpy().tolist() + [tokenizer.vcot_id], dtype=torch.long)
-    #     for x in sources_id
-    # ]
-
     sources_id_latent = [
         torch.tensor(x.numpy().tolist() + [tokenizer.bot_id], dtype=torch.long)
         for x in sources_id

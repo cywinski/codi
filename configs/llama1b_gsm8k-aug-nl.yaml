@@ -13,7 +13,7 @@ data_args:
     - "icot_full"
     # - "commonsense"
     # - "strategy"
-  max_samples: 1000
+  max_samples: 100
 
 # Wandb Arguments
 wandb:
@@ -28,9 +28,9 @@ hub:
 
 # Training Arguments
 training_args:
-  output_dir: "./models/codi_llama1b_gsm8k_commonsense-the-answer-is"
-  expt_name: "codi_llama1b_gsm8k_commonsense-the-answer-is"
-  logging_dir: "./models/codi_llama1b_gsm8k_commonsense-the-answer-is/logs"
+  output_dir: "./models/codi_llama1b_test"
+  expt_name: "codi_llama1b_test"
+  logging_dir: "./models/codi_llama1b_test/logs"
   logging_steps: 10
   seed: 11
   model_max_length: 512
@@ -38,7 +38,7 @@ training_args:
   gradient_accumulation_steps: 1
   bf16: true
   max_steps: -1
-  num_train_epochs: 1
+  num_train_epochs: 10
   learning_rate: 8e-4
   max_grad_norm: 2.0
   save_strategy: "epoch"

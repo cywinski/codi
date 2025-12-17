@@ -11,27 +11,27 @@ model_args:
 data_args:
   data_names:
     - "icot_full"
-    - "strategy"
     - "commonsense"
+    # - "strategy"
   max_samples: null
 
 # Wandb Arguments
 wandb:
   project: "codi"
-  run_name: "codi_llama1b_gsm8k-strategyqa-commonsense2"
+  run_name: "codi_llama1b-answer_only"
 
 # Hub Arguments
 hub:
   push_to_hub: true
-  account: "bcywinski"
+  account: "HF_ACCOUNT"
   private_repo: false
   resume_from_checkpoint: "bcywinski/codi_llama1b_gsm8k-strategyqa-commonsense"  # HuggingFace checkpoint ID to resume training from (e.g., "username/model-name")
 
 # Training Arguments
 training_args:
-  output_dir: "./models/codi_llama1b_gsm8k-strategyqa-commonsense2"
-  expt_name: "codi_llama1b_gsm8k-strategyqa-commonsense2"
-  logging_dir: "./models/codi_llama1b_gsm8k-strategyqa-commonsense2/logs"
+  output_dir: "./models/codi_llama1b-answer_only"
+  expt_name: "codi_llama1b-answer_only"
+  logging_dir: "./models/codi_llama1b-answer_only/logs"
   logging_steps: 10
   seed: 11
   model_max_length: 512
@@ -39,11 +39,11 @@ training_args:
   gradient_accumulation_steps: 1
   bf16: true
   max_steps: -1
-  num_train_epochs: 3
+  num_train_epochs: 10
   learning_rate: 8e-4
   max_grad_norm: 2.0
   save_strategy: "epoch"
-  save_total_limit: 1
+  save_total_limit: 10
   save_safetensors: false
   weight_decay: 0.1
   warmup_ratio: 0.03
@@ -58,10 +58,15 @@ training_args:
   distill_loss_div_std: true
   exp_mode: false
   exp_data_num: 200
-  remove_eos: true
+  remove_eos: false
   distill_loss_factor: 20
+  ref_loss_factor: 1.0
   print_ref_model_stats: false
   print_loss: false
   max_token_num: 256
   dataloader_num_workers: 4
   ddp_find_unused_parameters: false
+  sft_loss_factor: 1.0
+  include_last_cot: false
+  ce_loss_factor: 1.0
+  answer_only: true

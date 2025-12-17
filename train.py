@@ -4,17 +4,14 @@ import os
 from math import ceil
 from pathlib import Path
 
-import torch
 import torch.distributed as dist
 import transformers
+import wandb
 import yaml
 from dotenv import load_dotenv
-from huggingface_hub import hf_hub_download
 from peft import LoraConfig, TaskType
-from safetensors.torch import load_file
 from transformers import Trainer
 
-import wandb
 from src.datasets import make_supervised_data_module
 from src.model import CODI, DataArguments, ModelArguments, TrainingArguments
 
@@ -73,6 +70,7 @@ class CustomTrainer(Trainer):
                     "ce_loss": outputs["ce_loss"],
                     "distill_loss": outputs["distill_loss"],
                     "ref_ce_loss": outputs["ref_ce_loss"],
+                    "ans_ce_loss": outputs["ans_ce_loss"],
                 }
             )
         return loss
@@ -168,58 +166,6 @@ def train():
             init_lora_weights=True,
         )
 
-    model = CODI(model_args, training_args, lora_config)
-
-    # Load model weights from HuggingFace checkpoint if specified
-    if hub_config and hub_config.get("resume_from_checkpoint"):
-        checkpoint_id = hub_config.get("resume_from_checkpoint")
-        if is_main_process():
-            print(f"Loading model weights from HuggingFace checkpoint: {checkpoint_id}")
-
-        hf_token = (
-            os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN") or model_args.token
-        )
-
-        # Try to load safetensors first, then fall back to pytorch_model.bin
-        try:
-            checkpoint_path = hf_hub_download(
-                repo_id=checkpoint_id,
-                filename="model.safetensors",
-                token=hf_token,
-            )
-            state_dict = load_file(checkpoint_path)
-        except Exception:
-            try:
-                checkpoint_path = hf_hub_download(
-                    repo_id=checkpoint_id,
-                    filename="pytorch_model.bin",
-                    token=hf_token,
-                )
-                state_dict = torch.load(checkpoint_path, map_location="cpu")
-            except Exception as e:
-                if is_main_process():
-                    print(
-                        f"Warning: Could not load checkpoint from {checkpoint_id}: {e}"
-                    )
-                    print("Continuing with default initialization...")
-                state_dict = None
-
-        if state_dict is not None:
-            # Load state dict with strict=False to handle any key mismatches
-            missing_keys, unexpected_keys = model.load_state_dict(
-                state_dict, strict=False
-            )
-            if is_main_process():
-                if missing_keys:
-                    print(
-                        f"Missing keys when loading checkpoint: {len(missing_keys)} keys"
-                    )
-                if unexpected_keys:
-                    print(
-                        f"Unexpected keys when loading checkpoint: {len(unexpected_keys)} keys"
-                    )
-                print(f"Successfully loaded weights from {checkpoint_id}")
-
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         token=model_args.token,
@@ -228,12 +174,27 @@ def train():
         padding_side="right",
         use_fast=False,
     )
+    print(f"{len(tokenizer)=}")
 
     if tokenizer.pad_token_id is None:
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-        tokenizer.pad_token_id = model.pad_token_id
-        if tokenizer.pad_token_id is None:  # error handling
-            tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("[PAD]")
+        tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("[PAD]")
+
+    # Add extra (non-core) special tokens using 'additional_special_tokens'
+    additional_special_tokens = [
+        "<|bocot|>",
+        "<|eocot|>",
+    ]
+    tokenizer.add_special_tokens(
+        {"additional_special_tokens": additional_special_tokens}
+    )
+
+    # Optionally assign ids for later convenience
+    tokenizer.bot_id = tokenizer.convert_tokens_to_ids("<|bocot|>")  # beginning of CoT
+    tokenizer.eot_id = tokenizer.convert_tokens_to_ids("<|eocot|>")  # end of CoT
+    print(f"{len(tokenizer)=}")
+
+    model = CODI(model_args, training_args, lora_config, tokenizer)
 
     training_args.output_dir = os.path.join(
         training_args.output_dir,
@@ -264,24 +225,13 @@ def train():
     data_module = make_supervised_data_module(
         tokenizer=tokenizer,
         data_args=data_args,
-        model=model,
         training_args=training_args,
     )
     trainer = CustomTrainer(
         model=model, tokenizer=tokenizer, args=training_args, **data_module
     )
     trainer.train()
-
-    # to avoid the error of saving the model
-    # if "llama" in model_args.model_name_or_path:
-    #    trainer.model.codi.model.model.embed_tokens.weight = torch.nn.Parameter(model.codi.model.lm_head.weight.clone())
-    # if "gpt2" in model_args.model_name_or_path:
-    #    trainer.model.codi.transformer.wte.weight = torch.nn.Parameter(model.codi.lm_head.weight.clone())
-    # if "qwen" in model_args.model_name_or_path.lower():
-    #    trainer.model.codi.base_model.model.model.embed_tokens.weight = torch.nn.Parameter(model.codi.base_model.model.lm_head.weight.clone())
-
-    # trainer.save_state()
-    trainer.save_model(output_dir=training_args.output_dir)
+    # trainer.save_model(output_dir=training_args.output_dir)
 
 
 if __name__ == "__main__":

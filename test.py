@@ -13,11 +13,12 @@
 #    limitations under the License.
 
 import argparse
+import csv
 import json
 import logging
 import math
 import os
-import re
+import statistics
 import sys
 
 import torch
@@ -42,7 +43,18 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
 
 
-def evaluation(model_args, data_args, training_args):
+def evaluation(
+    model_args,
+    data_args,
+    training_args,
+    iteration=None,
+    output_prefix=None,
+    skip_thinking=False,
+    verbalize_cot=False,
+    answer_only=True,
+    temperature=0.1,
+    ablate_latent=None,
+):
     # Load model using from_pretrained
     model = CODI.from_pretrained(
         checkpoint_path=model_args.ckpt_dir,
@@ -60,25 +72,25 @@ def evaluation(model_args, data_args, training_args):
         strict=False,
     )
 
-    # Load tokenizer
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model.model_name,
-        token=model_args.token,
-        model_max_length=training_args.model_max_length,
-        padding_side="left",
-        use_fast=False,
-    )
+    # # Load tokenizer
+    # tokenizer = transformers.AutoTokenizer.from_pretrained(
+    #     model.model_name,
+    #     token=model_args.token,
+    #     model_max_length=training_args.model_max_length,
+    #     padding_side="left",
+    #     use_fast=False,
+    # )
 
-    if tokenizer.pad_token_id is None:
-        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-        tokenizer.pad_token_id = model.pad_token_id
-        if tokenizer.pad_token_id is None:  # error handling
-            tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("[PAD]")
+    # if tokenizer.pad_token_id is None:
+    #     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    #     tokenizer.pad_token_id = model.pad_token_id
+    #     if tokenizer.pad_token_id is None:  # error handling
+    #         tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("[PAD]")
 
-    # Add special tokens if not already present
-    tokenizer.add_special_tokens({"additional_special_tokens": ["<|bot|>", "<|eot|>"]})
-    tokenizer.bot_id = tokenizer.convert_tokens_to_ids("<|bot|>")
-    tokenizer.eot_id = tokenizer.convert_tokens_to_ids("<|eot|>")
+    # # Add special tokens if not already present
+    # tokenizer.add_special_tokens({"additional_special_tokens": ["<|bot|>", "<|eot|>"]})
+    # tokenizer.bot_id = tokenizer.convert_tokens_to_ids("<|bot|>")
+    # tokenizer.eot_id = tokenizer.convert_tokens_to_ids("<|eot|>")
 
     device = "cuda"
 
@@ -115,13 +127,31 @@ def evaluation(model_args, data_args, training_args):
     elif "gsm8k" == data_name:
         dataset = load_dataset("gsm8k", "main")
         test_set = dataset["test"]
+    elif "strategy" == data_name:
+        dataset = load_dataset("zen-E/StrategyQA_CoT_GPT4o")
+        test_set = dataset["train"]
     else:
         raise NotImplementedError
 
     logging.warning("Formatting inputs...")
-    question = [
-        f"{example[question_name].strip().replace('  ', ' ')}" for example in test_set
-    ]
+    print(f"skip_thinking: {skip_thinking}")
+    print(f"answer_only: {answer_only}")
+    if "strategy" == data_name:
+        question = [
+            f"{example[question_name].strip().replace('  ', ' ')}. Answer only 'true' or 'false' and nothing else."
+            for example in test_set
+        ]
+    else:
+        if answer_only:
+            question = [
+                f"{example[question_name].strip().replace('  ', ' ')} Output only the answer and nothing else."
+                for example in test_set
+            ]
+        else:
+            question = [
+                example[question_name].strip().replace("  ", " ")
+                for example in test_set
+            ]
     answer = []
 
     # get numerical answer
@@ -160,7 +190,16 @@ def evaluation(model_args, data_args, training_args):
 
     ans_pred_list = []
     len_cot = []
+    detailed_results = []  # Store answer, ground truth, and correctness for each example
     model.eval()
+    if model.tokenizer.pad_token_id is None:
+        model.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        model.tokenizer.pad_token_id = model.tokenizer.convert_tokens_to_ids("[PAD]")
+
+    tokenizer = model.tokenizer
+    tokenizer.bot_id = tokenizer.convert_tokens_to_ids("<|bocot|>")  # beginning of CoT
+    tokenizer.eot_id = tokenizer.convert_tokens_to_ids("<|eocot|>")
+    print(f"{len(tokenizer)=}")
 
     for step in range(eval_step):
         # Prepare batch
@@ -176,8 +215,10 @@ def evaluation(model_args, data_args, training_args):
             batch_questions,
             return_tensors="pt",
             padding="longest",
+            padding_side="left",
         )
         input_ids = batch["input_ids"].to(device)
+        print(tokenizer.convert_ids_to_tokens(input_ids[0]))
         attention_mask = batch["attention_mask"].to(device)
 
         # Generate using the abstract generate method
@@ -187,13 +228,19 @@ def evaluation(model_args, data_args, training_args):
                 attention_mask=attention_mask,
                 tokenizer=tokenizer,
                 max_new_tokens=256,
+                output_hidden_states=True,
                 num_latent_iterations=training_args.inf_latent_iterations,
-                temperature=0.1,
+                temperature=temperature,
                 top_k=40,
                 top_p=0.95,
                 greedy=training_args.greedy,
                 return_latent_vectors=False,
                 remove_eos=training_args.remove_eos,
+                skip_thinking=skip_thinking,
+                verbalize_cot=verbalize_cot,
+                sot_token=tokenizer.convert_tokens_to_ids("<|bocot|>"),
+                eot_token=tokenizer.convert_tokens_to_ids("<|eocot|>"),
+                ablate_latent=ablate_latent,
             )
 
         # Process generated sequences
@@ -214,20 +261,40 @@ def evaluation(model_args, data_args, training_args):
                 generated_tokens = generated_tokens[:eos_idx]
 
             len_cot.append(len(generated_tokens))
-            decoded_pred = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            decoded_pred = tokenizer.decode(generated_tokens, skip_special_tokens=False)
+
+            question_idx = step * data_args.batch_size + mini_step
+            pred_answer = extract_answer_number(decoded_pred, data_args)
 
             if do_print:
-                question_idx = step * data_args.batch_size + mini_step
                 print(f"Question {question_idx} Starts...")
                 print(f"Q: {question[question_idx]}")
                 print(decoded_pred)
                 print(f"Question {question_idx} Ends")
-                print(
-                    f"Prediction={extract_answer_number(decoded_pred, data_args)}; Groundtruth={answer[question_idx]}"
-                )
+                print(f"Prediction={pred_answer}; Groundtruth={answer[question_idx]}")
                 print("")
 
-            ans_pred_list.append(extract_answer_number(decoded_pred, data_args))
+            ans_pred_list.append(pred_answer)
+
+            # Determine correctness
+            is_correct = False
+            gt = answer[question_idx]
+            if isinstance(pred_answer, list):
+                if gt in pred_answer:
+                    is_correct = True
+            else:
+                if pred_answer == gt:
+                    is_correct = True
+
+            # Store detailed result
+            detailed_results.append(
+                {
+                    "question": question[question_idx],
+                    "answer": pred_answer,
+                    "ground_truth": gt,
+                    "is_correct": is_correct,
+                }
+            )
 
     accuracy = compute_accuracy(answer, ans_pred_list)
 
@@ -236,33 +303,44 @@ def evaluation(model_args, data_args, training_args):
     )
     print(f"average length of COT: {sum(len_cot) / len(len_cot)}")
 
-    return 100 * accuracy
+    # Return accuracy and detailed results (CSV saving moved to main loop)
+    return 100 * accuracy, detailed_results
+
+
+import re
 
 
 def extract_answer_number(sentence: str, data_args) -> float:
+    print(f"sentence: {sentence}")
     sentence = sentence.replace(",", "")
+    if "commonsense" in data_args.data_names[0]:
+        return sentence.strip()[-1]
     pred = [s for s in re.findall(r"-?\d+\.?\d*", sentence)]
     if not pred:
-        # Handle data_names as list (from command-line) or string (from config)
-        data_name = (
-            data_args.data_names[0]
-            if isinstance(data_args.data_names, list) and len(data_args.data_names) > 0
-            else data_args.data_names
-        )
-
-        if "commonsense" in data_name:
-            pred = sentence.split("The answer is:")[-1].strip()
-            if pred and pred[0] not in "ABCDE":
-                return "C"
-            return pred[0] if pred else "C"
-        elif "strategy" in data_name or "prontoqa" in data_name.lower():
-            if "True" in sentence:
-                return True
-            elif "False" in sentence:
-                return False
-            else:
-                raise ValueError
         return float("inf")
+    pred = float(pred[-1])
+    return pred
+    # if not pred:
+    #     # Handle data_names as list (from command-line) or string (from config)
+    #     data_name = (
+    #         data_args.data_names[0]
+    #         if isinstance(data_args.data_names, list) and len(data_args.data_names) > 0
+    #         else data_args.data_names
+    #     )
+
+    #     if "commonsense" in data_name:
+    #         pred = sentence.split("The answer is:")[-1].strip()
+    #         if pred and pred[0] not in "ABCDE":
+    #             return "C"
+    #         return pred[0] if pred else "C"
+    #     elif "strategy" in data_name or "prontoqa" in data_name.lower():
+    #         if "True" in sentence:
+    #             return True
+    #         elif "False" in sentence:
+    #             return False
+    #         else:
+    #             raise ValueError
+    #     return float("inf")
 
     # use the last number as the answer
     pred_answer = float(pred[-1])
@@ -299,15 +377,66 @@ if __name__ == "__main__":
             # Remove it from sys.argv so HfArgumentParser doesn't see it
             sys.argv.pop(1)
 
-    # Also check for --config_file flag
+    # Also check for --config_file flag and --output_prefix
     arg_parser = argparse.ArgumentParser(description="Test CODI model", add_help=False)
     arg_parser.add_argument(
         "--config_file", type=str, default=None, help="Path to JSON or YAML config file"
+    )
+    arg_parser.add_argument(
+        "--output_prefix",
+        type=str,
+        default=None,
+        help="Prefix to add to CSV output filename",
+    )
+    arg_parser.add_argument(
+        "--skip_thinking",
+        action="store_true",
+        default=False,
+        help="Skip thinking step",
+    )
+    arg_parser.add_argument(
+        "--verbalize_cot",
+        action="store_true",
+        default=False,
+        help="Verbalize chain of thought",
+    )
+    arg_parser.add_argument(
+        "--csv_filename",
+        type=str,
+        default=None,
+        help="Filename for CSV output (if not provided, auto-generated)",
+    )
+    arg_parser.add_argument(
+        "--answer_only",
+        type=lambda x: x.lower() == "true" if isinstance(x, str) else bool(x),
+        default=None,
+        nargs="?",
+        const=True,
+        help="Add 'Output only the answer and nothing else.' to each question. Use --answer_only True/False or just --answer_only (default: True, maintains current behavior)",
+    )
+    arg_parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Temperature for generation (default: 0.1)",
+    )
+    arg_parser.add_argument(
+        "--ablate_latent",
+        type=str,
+        default=None,
+        help="Type of latent ablation: 'zero', 'random', or 'mean' (default: None, no ablation)",
     )
     config_args, remaining_args = arg_parser.parse_known_args()
 
     # Use --config_file flag if provided, otherwise use positional argument we found
     config_path = config_args.config_file or config_path
+
+    # Extract output_prefix, csv_filename, answer_only, temperature, and ablate_latent before processing config
+    output_prefix = config_args.output_prefix
+    csv_filename = config_args.csv_filename
+    answer_only = config_args.answer_only
+    temperature = config_args.temperature
+    ablate_latent = config_args.ablate_latent
 
     if config_path:
         # Remove --config_file and its value from sys.argv if present
@@ -316,6 +445,49 @@ if __name__ == "__main__":
             sys.argv.pop(idx)  # Remove --config_file
             if idx < len(sys.argv) and not sys.argv[idx].startswith("-"):
                 sys.argv.pop(idx)  # Remove config file path
+
+        # Remove --output_prefix and its value from sys.argv if present
+        if "--output_prefix" in sys.argv:
+            idx = sys.argv.index("--output_prefix")
+            sys.argv.pop(idx)  # Remove --output_prefix
+            if idx < len(sys.argv) and not sys.argv[idx].startswith("-"):
+                sys.argv.pop(idx)  # Remove output_prefix value
+
+        # Remove --csv_filename and its value from sys.argv if present
+        if "--csv_filename" in sys.argv:
+            idx = sys.argv.index("--csv_filename")
+            sys.argv.pop(idx)  # Remove --csv_filename
+            if idx < len(sys.argv) and not sys.argv[idx].startswith("-"):
+                sys.argv.pop(idx)  # Remove csv_filename value
+
+        # Remove --skip_thinking from sys.argv if present
+        if "--skip_thinking" in sys.argv:
+            sys.argv.remove("--skip_thinking")
+
+        # Remove --verbalize_cot from sys.argv if present
+        if "--verbalize_cot" in sys.argv:
+            sys.argv.remove("--verbalize_cot")
+
+        # Remove --answer_only and its value from sys.argv if present
+        if "--answer_only" in sys.argv:
+            idx = sys.argv.index("--answer_only")
+            sys.argv.pop(idx)  # Remove --answer_only
+            if idx < len(sys.argv) and not sys.argv[idx].startswith("-"):
+                sys.argv.pop(idx)  # Remove answer_only value (e.g., "True" or "False")
+
+        # Remove --temperature and its value from sys.argv if present
+        if "--temperature" in sys.argv:
+            idx = sys.argv.index("--temperature")
+            sys.argv.pop(idx)  # Remove --temperature
+            if idx < len(sys.argv) and not sys.argv[idx].startswith("-"):
+                sys.argv.pop(idx)  # Remove temperature value
+
+        # Remove --ablate_latent and its value from sys.argv if present
+        if "--ablate_latent" in sys.argv:
+            idx = sys.argv.index("--ablate_latent")
+            sys.argv.pop(idx)  # Remove --ablate_latent
+            if idx < len(sys.argv) and not sys.argv[idx].startswith("-"):
+                sys.argv.pop(idx)  # Remove ablate_latent value
 
         # Load config file
         if config_path.endswith(".yaml") or config_path.endswith(".yml"):
@@ -342,17 +514,197 @@ if __name__ == "__main__":
         # TrainingArguments needs special handling
         training_config = config.get("training_args", {})
         training_args = TrainingArguments(**training_config)
+
+        # Get output_prefix from config if not provided via command line
+        if output_prefix is None:
+            output_prefix = config.get("output_prefix")
+
+        # Get csv_filename from config if not provided via command line
+        if csv_filename is None:
+            csv_filename = config.get("csv_filename")
+
+        # Get answer_only from config if not provided via command line (default to True to maintain current behavior)
+        # If answer_only is None (not set), check config, otherwise use True as default
+        if answer_only is None:
+            answer_only = config.get("answer_only", True)
+        # If answer_only was explicitly set via command line (True or False), keep that value
+
+        # Get temperature from config if not provided via command line (default to 0.1)
+        if temperature is None:
+            temperature = config.get("temperature", 0.1)
+
+        # Get ablate_latent from config if not provided via command line
+        if ablate_latent is None:
+            ablate_latent = config.get("ablate_latent")
     else:
+        # Remove --output_prefix and its value from sys.argv if present (before HfArgumentParser)
+        if "--output_prefix" in sys.argv:
+            idx = sys.argv.index("--output_prefix")
+            sys.argv.pop(idx)  # Remove --output_prefix
+            if idx < len(sys.argv) and not sys.argv[idx].startswith("-"):
+                sys.argv.pop(idx)  # Remove output_prefix value
+
+        # Remove --csv_filename and its value from sys.argv if present (before HfArgumentParser)
+        if "--csv_filename" in sys.argv:
+            idx = sys.argv.index("--csv_filename")
+            sys.argv.pop(idx)  # Remove --csv_filename
+            if idx < len(sys.argv) and not sys.argv[idx].startswith("-"):
+                sys.argv.pop(idx)  # Remove csv_filename value
+
+        # Remove --skip_thinking from sys.argv if present (before HfArgumentParser)
+        if "--skip_thinking" in sys.argv:
+            sys.argv.remove("--skip_thinking")
+
+        # Remove --verbalize_cot from sys.argv if present (before HfArgumentParser)
+        if "--verbalize_cot" in sys.argv:
+            sys.argv.remove("--verbalize_cot")
+
+        # Remove --answer_only and its value from sys.argv if present (before HfArgumentParser)
+        if "--answer_only" in sys.argv:
+            idx = sys.argv.index("--answer_only")
+            sys.argv.pop(idx)  # Remove --answer_only
+            if idx < len(sys.argv) and not sys.argv[idx].startswith("-"):
+                sys.argv.pop(idx)  # Remove answer_only value (e.g., "True" or "False")
+
+        # Remove --temperature and its value from sys.argv if present (before HfArgumentParser)
+        if "--temperature" in sys.argv:
+            idx = sys.argv.index("--temperature")
+            sys.argv.pop(idx)  # Remove --temperature
+            if idx < len(sys.argv) and not sys.argv[idx].startswith("-"):
+                sys.argv.pop(idx)  # Remove temperature value
+
+        # Remove --ablate_latent and its value from sys.argv if present (before HfArgumentParser)
+        if "--ablate_latent" in sys.argv:
+            idx = sys.argv.index("--ablate_latent")
+            sys.argv.pop(idx)  # Remove --ablate_latent
+            if idx < len(sys.argv) and not sys.argv[idx].startswith("-"):
+                sys.argv.pop(idx)  # Remove ablate_latent value
+
         # Use HfArgumentParser for command-line arguments
         parser = transformers.HfArgumentParser(
             (ModelArguments, DataArguments, TrainingArguments)
         )
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+        # answer_only defaults to True if not set via command line (maintains current behavior)
+        if answer_only is None:
+            answer_only = True
+
+        # temperature defaults to 0.1 if not set via command line
+        if temperature is None:
+            temperature = 0.1
+
     accu_list = []
+    all_detailed_results = []  # Store detailed results from all iterations
+    # Use command-line values
+    skip_thinking = config_args.skip_thinking
+    verbalize_cot = config_args.verbalize_cot
+    # answer_only was already extracted and processed in the if/else branches above
+    print(f"verbalize_cot: {verbalize_cot}")
+    print(f"skip_thinking: {skip_thinking}")
+    print(f"answer_only: {answer_only}")
+    print(f"temperature: {temperature}")
+    print(f"ablate_latent: {ablate_latent}")
     for i in range(training_args.inf_num_iterations):
-        accu = evaluation(model_args, data_args, training_args)
+        accu, detailed_results = evaluation(
+            model_args,
+            data_args,
+            training_args,
+            iteration=i,
+            output_prefix=output_prefix,
+            skip_thinking=skip_thinking,
+            verbalize_cot=verbalize_cot,
+            answer_only=answer_only,
+            temperature=temperature,
+            ablate_latent=ablate_latent,
+        )
         accu_list.append(accu)
+        # Add iteration number to detailed results
+        for result in detailed_results:
+            result["iteration"] = i + 1
+        all_detailed_results.extend(detailed_results)
+
+    # Calculate mean and std dev if multiple iterations
+    mean_acc = sum(accu_list) / len(accu_list)
+    std_dev_acc = statistics.stdev(accu_list) if len(accu_list) > 1 else 0.0
+
     print(
-        f"Average accuracy over {training_args.inf_num_iterations} sampling: {sum(accu_list) / len(accu_list)}"
+        f"Average accuracy over {training_args.inf_num_iterations} sampling: {mean_acc:.2f}%"
     )
+    if training_args.inf_num_iterations > 1:
+        print(f"Standard deviation: {std_dev_acc:.2f}%")
+
+    # Save results to CSV
+    if csv_filename is None:
+        # Auto-generate filename if not provided
+        filename_parts = []
+        if output_prefix:
+            filename_parts.append(output_prefix)
+        # Get data_name from data_args
+        data_name = (
+            data_args.data_names[0]
+            if isinstance(data_args.data_names, list) and len(data_args.data_names) > 0
+            else data_args.data_names
+        )
+        filename_parts.append(data_name)
+        csv_filename = f"results_{'_'.join(filename_parts)}.csv"
+
+    # Use output_dir if provided
+    if hasattr(training_args, "output_dir") and training_args.output_dir:
+        # Create output directory if it doesn't exist
+        os.makedirs(training_args.output_dir, exist_ok=True)
+        # Join output_dir with csv_filename
+        csv_filepath = os.path.join(training_args.output_dir, csv_filename)
+    else:
+        # Use current directory if output_dir not provided
+        csv_filepath = csv_filename
+
+    # Write CSV with accuracy values
+    with open(csv_filepath, "w", newline="", encoding="utf-8") as csvfile:
+        if training_args.inf_num_iterations > 1:
+            # Multiple iterations: save each accuracy, mean, and std dev
+            fieldnames = ["iteration", "accuracy"]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for i, acc in enumerate(accu_list):
+                writer.writerow({"iteration": i + 1, "accuracy": f"{acc:.2f}"})
+            writer.writerow({"iteration": "mean", "accuracy": f"{mean_acc:.2f}"})
+            writer.writerow({"iteration": "std_dev", "accuracy": f"{std_dev_acc:.2f}"})
+        else:
+            # Single iteration: save only accuracy
+            fieldnames = ["accuracy"]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerow({"accuracy": f"{accu_list[0]:.2f}"})
+
+    print(f"Results saved to {csv_filepath}")
+
+    # Save detailed results (answer, ground truth, correctness) to separate CSV
+    detailed_csv_filename = (
+        csv_filename.replace(".csv", "_detailed.csv")
+        if csv_filename.endswith(".csv")
+        else f"{csv_filename}_detailed.csv"
+    )
+    if hasattr(training_args, "output_dir") and training_args.output_dir:
+        detailed_csv_filepath = os.path.join(
+            training_args.output_dir, detailed_csv_filename
+        )
+    else:
+        detailed_csv_filepath = detailed_csv_filename
+
+    with open(detailed_csv_filepath, "w", newline="", encoding="utf-8") as csvfile:
+        fieldnames = ["iteration", "question", "answer", "ground_truth", "is_correct"]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for result in all_detailed_results:
+            writer.writerow(
+                {
+                    "iteration": result["iteration"],
+                    "question": result["question"],
+                    "answer": result["answer"],
+                    "ground_truth": result["ground_truth"],
+                    "is_correct": result["is_correct"],
+                }
+            )
+
+    print(f"Detailed results saved to {detailed_csv_filepath}")

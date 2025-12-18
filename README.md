@@ -44,4 +44,6 @@ python experiments/1_latent_iterations_accuracy.py
 python experiments/2_latent_token_probability_numbers.py
 python experiments/3_logit_lens_latents.py
 python experiments/4_mean_latent_patching_same_vs_diff.py --limit=10
+python experiments/5_mean_ablation_combined_templates.py
+python experiments/6_operation_probe_latent_vectors.py
 ```
